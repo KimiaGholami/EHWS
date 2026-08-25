@@ -1,4 +1,4 @@
-"""Extreme Layer-wise & Global Pruning -- Unstructured (ELGP-U).
+"""Extreme Hierarchical Weight Sparsity -- Unstructured (EHWS-U).
 
 A two-phase ADMM pruning method for causal LLMs, same as the
 semi-structured variant, but Phase 2 spends one *global* sparsity budget

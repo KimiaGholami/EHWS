@@ -26,12 +26,12 @@ try:
 except ImportError:
     pass
 
-from elgp.admm import Phase1Config, Phase2Config, run_phase1, run_phase2
-from elgp.calibration import get_c4_calibration, get_c4_eval, get_wikitext2_test
-from elgp.hparams import get_phase2_hparams
-from elgp.model_layers import discover_prunable_layers
-from elgp.perplexity import compute_perplexity
-from elgp.zeroshot import run_zeroshot
+from ehws.admm import Phase1Config, Phase2Config, run_phase1, run_phase2
+from ehws.calibration import get_c4_calibration, get_c4_eval, get_wikitext2_test
+from ehws.hparams import get_phase2_hparams
+from ehws.model_layers import discover_prunable_layers
+from ehws.perplexity import compute_perplexity
+from ehws.zeroshot import run_zeroshot
 
 
 def parse_args():
@@ -69,7 +69,7 @@ def parse_args():
     p.add_argument("--damping", type=float, default=0.01)
     p.add_argument(
         "--no-auto-hparams", action="store_true",
-        help="disable the per-model/per-sparsity (lr, lambda, schedule) lookup in elgp/hparams.py "
+        help="disable the per-model/per-sparsity (lr, lambda, schedule) lookup in ehws/hparams.py "
              "and use --p2-lr/--p2-lambda-max with a cosine schedule for every sparsity level instead",
     )
     p.add_argument("--skip-zeroshot", action="store_true")
@@ -151,7 +151,7 @@ def main():
             lr, lam, schedule = args.p2_lr, args.p2_lambda_max, "cosine"
         else:
             lr, lam, schedule = get_phase2_hparams(args.model, sparsity)
-            print(f"  auto hparams (elgp/hparams.py): lr={lr} lambda={lam} schedule={schedule}")
+            print(f"  auto hparams (ehws/hparams.py): lr={lr} lambda={lam} schedule={schedule}")
         p2_cfg = Phase2Config(
             target_sparsity=sparsity, rounds=args.p2_rounds, x_steps=args.p2_x_steps,
             micro_batch=args.micro_batch, grad_accum=args.grad_accum, lr=lr,

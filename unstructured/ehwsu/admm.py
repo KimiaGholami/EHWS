@@ -1,6 +1,6 @@
 """Phase 1 (layer-wise ADMM) and Phase 2 (global ADMM, unstructured) drivers.
 
-This is the unstructured sibling of the semi-structured `elgp/admm.py`:
+This is the unstructured sibling of the semi-structured `ehws/admm.py`:
 Phase 2 here spends one shared, global weight budget
 (`k_keep_total = round((1-s) * N_total)`) across the whole network at
 once, via `global_projection.global_diagonal_project`, instead of giving

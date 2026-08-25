@@ -1,4 +1,4 @@
-"""Extreme Layer-wise & Global Pruning (ELGP) -- the semi-structured variant.
+"""Extreme Hierarchical Weight Sparsity (EHWS) -- the semi-structured variant.
 
 A two-phase ADMM pruning method for causal LLMs:
 
@@ -6,7 +6,7 @@ A two-phase ADMM pruning method for causal LLMs:
   sequentially. Its dense proxy is trained against the true CE+KD loss
   rather than a per-layer reconstruction surrogate, and its sparse
   projection is a diagonal-Hessian-weighted magnitude score
-  (`elgp/diagonal_projection.py`). A per-layer saturation rule lets each
+  (`ehws/diagonal_projection.py`). A per-layer saturation rule lets each
   layer stop tightening its sparsity budget once it starts disagreeing
   with the true loss.
 - Phase 2 -- global ADMM: every layer's dense proxy is then jointly

@@ -32,12 +32,12 @@ try:
 except ImportError:
     pass
 
-from elgpu.admm import Phase1Config, Phase2Config, run_phase1, run_phase2
-from elgpu.calibration import get_c4_calibration, get_c4_eval, get_wikitext2_test
-from elgpu.hparams import get_phase2_hparams
-from elgpu.model_layers import discover_prunable_layers
-from elgpu.perplexity import compute_perplexity
-from elgpu.zeroshot import run_zeroshot
+from ehwsu.admm import Phase1Config, Phase2Config, run_phase1, run_phase2
+from ehwsu.calibration import get_c4_calibration, get_c4_eval, get_wikitext2_test
+from ehwsu.hparams import get_phase2_hparams
+from ehwsu.model_layers import discover_prunable_layers
+from ehwsu.perplexity import compute_perplexity
+from ehwsu.zeroshot import run_zeroshot
 
 
 def parse_args():
@@ -76,7 +76,7 @@ def parse_args():
     p.add_argument("--damping", type=float, default=0.01)
     p.add_argument(
         "--no-auto-hparams", action="store_true",
-        help="disable the per-model/per-sparsity (lr, lambda, schedule) lookup in elgpu/hparams.py "
+        help="disable the per-model/per-sparsity (lr, lambda, schedule) lookup in ehwsu/hparams.py "
              "and use --p2-lr/--p2-lambda-max with a cosine schedule for every sparsity level instead",
     )
     p.add_argument("--skip-zeroshot", action="store_true")
@@ -158,7 +158,7 @@ def main():
             lr, lam, schedule = args.p2_lr, args.p2_lambda_max, "cosine"
         else:
             lr, lam, schedule = get_phase2_hparams(args.model, sparsity)
-            print(f"  auto hparams (elgpu/hparams.py): lr={lr} lambda={lam} schedule={schedule}")
+            print(f"  auto hparams (ehwsu/hparams.py): lr={lr} lambda={lam} schedule={schedule}")
         p2_cfg = Phase2Config(
             target_sparsity=sparsity, rounds=args.p2_rounds, x_steps=args.p2_x_steps,
             micro_batch=args.micro_batch, grad_accum=args.grad_accum, lr=lr,

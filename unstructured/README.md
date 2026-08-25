@@ -1,6 +1,6 @@
-# ELGP-U -- unstructured, global-budget ADMM pruning
+# EHWS-U -- unstructured, global-budget ADMM pruning
 
-A two-phase pruning method for causal language models that trains
+EHWS stands for Extreme Hierarchical Weight Sparsity. A two-phase pruning method for causal language models that trains
 directly against the true next-token loss under a hard sparsity
 constraint, instead of matching each layer's dense output on calibration
 data and hoping that adds up to a good model. It extends
@@ -11,7 +11,7 @@ a cheap per-layer warm start followed by one global fine-tune, so the
 expensive part is paid for once per model instead of once per sparsity
 level.
 
-This is the unstructured sibling of ELGP (semi-structured): instead of
+This is the unstructured sibling of EHWS (semi-structured): instead of
 forcing every layer to the same sparsity ratio, the network gets one
 shared, global weight budget, and the data decides how much of it each
 layer gets. A layer that turns out to be collectively redundant gives up
@@ -38,7 +38,7 @@ text. `H` is the standard SparseGPT/CWS reconstruction Hessian
 `H_ii * v_i^2` (the cost of forcing that weight to zero), normalized by
 its own layer's mean score first -- otherwise a layer's initialization
 scale alone (not real importance) can dominate which layers get pruned;
-see `elgpu/global_projection.py` for why this matters and what happens
+see `ehwsu/global_projection.py` for why this matters and what happens
 without it.
 
 **Phase 1** runs this per layer, sequentially: one continuous ADMM run
@@ -91,7 +91,7 @@ Three things mattered, roughly in order of size of effect:
    distillation term, which dilutes the effective gradient magnitude
    enough that ELSA's own value is too conservative here. Scaling it to
    3x closed most of the remaining gap by itself (50.99 -> 35.05
-   WikiText2 PPL) -- see `elgpu/hparams.py`'s docstring. This has only
+   WikiText2 PPL) -- see `ehwsu/hparams.py`'s docstring. This has only
    been validated at the one (OPT-125M, 50%) point; other sparsity
    levels still use ELSA's unmodified published values.
 2. **Calibration set size matters a lot.** Going from 128 to 1024
@@ -109,7 +109,7 @@ Three things mattered, roughly in order of size of effect:
 ## Hyperparameters
 
 Phase 2's `(lr, lambda, schedule)` per model/sparsity come from
-`elgpu/hparams.py` -- see that file for the full table, which points
+`ehwsu/hparams.py` -- see that file for the full table, which points
 come from ELSA's own published values, and which one point has been
 empirically retuned for this method's objective (see above). Phase 1 has
 no published reference (it's this method's own addition):
@@ -134,7 +134,7 @@ Challenge, BoolQ, HellaSwag, OpenBookQA, RTE, Winogrande) via
 Any decoder-only causal LM built from `nn.Linear` layers inside repeated
 transformer blocks -- covers OPT, LLaMA, and HGRN (`fla-hub/hgrn-1.3B-100B`)
 out of the box, via an execution-order trace rather than hardcoded
-per-architecture wiring (`elgpu/model_layers.py`).
+per-architecture wiring (`ehwsu/model_layers.py`).
 
 ## Open items
 
@@ -150,7 +150,7 @@ per-architecture wiring (`elgpu/model_layers.py`).
 ## Layout
 
 ```
-elgpu/
+ehwsu/
   hessian.py               # H = (2/N) X^T X accumulation
   diagonal_projection.py   # Phase 1's Z-step: per-layer top-k by H_ii * v_i^2
   global_projection.py     # Phase 2's Z-step: ONE global top-k across every layer

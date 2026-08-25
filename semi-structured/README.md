@@ -1,6 +1,6 @@
-# ELGP -- semi-structured ADMM pruning
+# EHWS -- semi-structured ADMM pruning
 
-A two-phase pruning method for causal language models that trains
+EHWS stands for Extreme Hierarchical Weight Sparsity. A two-phase pruning method for causal language models that trains
 directly against the true next-token loss under a hard sparsity
 constraint, instead of matching each layer's dense output on calibration
 data and hoping that adds up to a good model. It extends
@@ -94,7 +94,7 @@ rule, not a solved problem.
 ## Hyperparameters
 
 Phase 2's `(lr, lambda, schedule)` per model/sparsity come from
-`elgp/hparams.py`, sourced from ELSA's own published values for the
+`ehws/hparams.py`, sourced from ELSA's own published values for the
 models it covers (OPT-125M, OPT-1.3B) -- see that file for the exact
 table and how the untabulated points were filled in. Phase 1 has no
 published reference (it's this method's own addition): ladder
@@ -118,12 +118,12 @@ Challenge, BoolQ, HellaSwag, OpenBookQA, RTE, Winogrande) via
 Any decoder-only causal LM built from `nn.Linear` layers inside repeated
 transformer blocks -- covers OPT, LLaMA, and HGRN (`fla-hub/hgrn-1.3B-100B`)
 out of the box, via an execution-order trace rather than hardcoded
-per-architecture wiring (`elgp/model_layers.py`).
+per-architecture wiring (`ehws/model_layers.py`).
 
 ## Layout
 
 ```
-elgp/
+ehws/
   hessian.py              # H = (2/N) X^T X accumulation
   diagonal_projection.py  # the Z-step: keep top-k by H_ii * v_i^2 per row
   model_layers.py          # architecture-agnostic prunable-layer discovery
