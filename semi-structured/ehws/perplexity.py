@@ -1,7 +1,8 @@
 """Perplexity evaluation on tokenized (n_chunks, seqlen) tensors.
 
 Standard next-token perplexity: average per-token negative log-likelihood
-across every held-out chunk, exponentiated.
+across every held-out chunk, exponentiated. Matches the WikiText2/C4
+protocol described in ELSA's Appendix B.1.
 """
 
 from __future__ import annotations

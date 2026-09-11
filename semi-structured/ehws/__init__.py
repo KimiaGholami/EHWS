@@ -1,39 +1,35 @@
-"""Extreme Hierarchical Weight Sparsity (EHWS) -- the semi-structured variant.
+"""EHWS -- semi-structured (uniform-ratio) ADMM pruning.
 
-A two-phase ADMM pruning method for causal LLMs:
-
-- Phase 1 -- layer-wise ADMM: each prunable nn.Linear is processed
-  sequentially. Its dense proxy is trained against the true CE+KD loss
-  rather than a per-layer reconstruction surrogate, and its sparse
-  projection is a diagonal-Hessian-weighted magnitude score
-  (`ehws/diagonal_projection.py`). A per-layer saturation rule lets each
-  layer stop tightening its sparsity budget once it starts disagreeing
-  with the true loss.
-- Phase 2 -- global ADMM: every layer's dense proxy is then jointly
-  re-optimized under one global loss (a single forward pass through the
-  whole network), warm-started from Phase 1, with one sparsity ratio
-  shared uniformly by every layer -- "semi-structured" in the sense that
-  every layer keeps the same fraction of weights, even though which
-  specific weights survive within a layer is unstructured.
-
-See README.md for the full method write-up, hyperparameters, and
-reproduction commands.
+Two-phase ADMM pruning method for causal language models that trains
+directly against the true next-token loss under a hard sparsity
+constraint. Extends ELSA (*The Unseen Frontier: Pushing the Limits of
+LLM Sparsity with Surrogate-Free ADMM*) with a per-layer warm-start
+(Phase 1) before a joint global fine-tune (Phase 2), both sharing one
+uniform sparsity ratio across every layer. See README.md for the full
+method write-up, and PROGRESS.md (in the sibling
+`Extreme_Layer_Global_Pruning` package this was synced from) for the
+session-by-session history behind the current design.
 """
 
+from .admm import LayerState, Phase1Config, Phase2Config, build_dense_states, run_phase1, run_phase2
 from .diagonal_projection import diagonal_project
 from .hessian import LayerHessian
-from .model_layers import discover_prunable_layers, PrunableLayer
 from .losses import combined_loss
-from .admm import Phase1Config, Phase2Config, run_phase1, run_phase2
+from .model_layers import PrunableLayer, disable_fused_kernels, discover_prunable_layers
+from .obs_projection import obs_project
 
 __all__ = [
     "LayerHessian",
     "diagonal_project",
+    "obs_project",
     "discover_prunable_layers",
+    "disable_fused_kernels",
     "PrunableLayer",
     "combined_loss",
+    "LayerState",
     "Phase1Config",
     "Phase2Config",
+    "build_dense_states",
     "run_phase1",
     "run_phase2",
 ]

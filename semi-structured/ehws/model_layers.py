@@ -1,22 +1,22 @@
 """Architecture-agnostic discovery of prunable layers, in execution order.
 
-Phase 1 processes layers one at a time, and each layer's Hessian needs to
-be computed from activations that have already passed through every
-earlier layer we've pruned. To get the true processing order for any
-decoder-only causal LM -- OPT's attention+MLP stack, HGRN's gated
-recurrent stack, or anything else built the same way -- without hard
-coding per-architecture wiring, we run one real forward pass with a hook
-on every candidate nn.Linear that records the order it actually gets
-called in. That gives the true topological order regardless of
-architecture, including branching (e.g. attention's q/k/v projections all
-run before the block combines them into the input for the output
-projection).
+The Proposed Work's Phase 1 (slide 39) processes "layer l" sequentially,
+recomputing each subsequent layer's Hessian only after the current one
+finishes (so it sees activations that have already flowed through earlier,
+now-pruned, layers). To do this for *any* decoder-only causal LM (OPT's
+attention+MLP nn.Linear stack, HGRN's gated-recurrent nn.Linear stack, ...)
+without hand-writing per-architecture wiring, we run one real dry-run
+forward pass of the whole model with a hook on every candidate
+``nn.Linear`` that records the order it was actually *called* in -- that
+gives the true topological/sequential order regardless of architecture,
+including branching (e.g. attention's q/k/v computed before the block
+combines them into the input for o_proj).
 
-Only nn.Linear modules that live inside a transformer block are
-candidates. That naturally excludes the token embedding and the final
-lm_head, which sit outside the block list -- matching standard practice
-in this line of work (SparseGPT, Wanda, and friends all leave embeddings
-and the output head dense).
+Only ``nn.Linear`` modules that live *inside* a transformer block are
+candidates -- this naturally excludes the token embedding and the final
+``lm_head`` (which sit outside the block list), matching every pruning
+paper referenced in the background section (SparseGPT/Wanda/RIA/AWP/CWS
+all leave embeddings and the output head dense).
 """
 
 from __future__ import annotations
@@ -37,8 +37,10 @@ class PrunableLayer:
 def get_decoder_blocks(model: nn.Module) -> list[nn.Module]:
     """Locate the list of repeated transformer/recurrent blocks.
 
-    Covers OPT (`model.model.decoder.layers`) and the `model.model.layers`
-    convention used by LLaMA and by HGRN (`fla-hub/hgrn-1.3B-100B`).
+    Covers OPT (`model.model.decoder.layers`), and the shared
+    `model.model.layers` convention used by LLaMA, and by HGRN/`fla`'s
+    HGRNForCausalLM (`model.model.layers`) -- verified directly against
+    `fla-hub/hgrn-1.3B-100B`'s module tree.
     """
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return list(model.transformer.h)
@@ -60,14 +62,55 @@ def _find_linears(block: nn.Module, prefix: str) -> dict[str, nn.Linear]:
     return found
 
 
+def disable_fused_kernels(model: nn.Module) -> int:
+    """Turn off fused-linear kernels that read an nn.Linear's `.weight`
+    directly instead of calling its `.forward()` -- e.g. `fla`'s GatedMLP
+    (`fuse_swiglu=True` by default), which computes
+    `swiglu_linear(gate, y, down_proj.weight, down_proj.bias)` as one
+    fused Triton kernel and never invokes `down_proj.__call__`.
+
+    Both `discover_prunable_layers` (below) and `hessian.py`'s Hessian
+    accumulation depend on a `forward_pre_hook` firing on every prunable
+    layer -- for a layer whose weight is only ever read directly by a
+    fused kernel, that hook can never fire, so its true input activations
+    are structurally unobservable this way regardless of anything else
+    this codebase does. Found on `fla-hub/hgrn-1.3B-100B`: layer discovery
+    raised with all 24 `mlp.down_proj` layers "never called during the
+    trace". Verified fix is exact, not an approximation: setting
+    `fuse_swiglu=False` on every `GatedMLP` makes `forward()` take the
+    `self.down_proj(swiglu(gate, y))` branch instead of the fused one
+    (same source file, `fla/modules/mlp.py`) -- confirmed bit-identical
+    logits (max abs diff 0.0) between the fused and unfused paths on a
+    real forward pass through the real model.
+
+    Duck-typed on the `fuse_swiglu` attribute rather than importing `fla`
+    specifically, so this keeps working for any architecture using the
+    same fused-kernel-with-an-opt-out convention, and does nothing (0
+    patched) for architectures that don't have it -- safe to call
+    unconditionally on every model this pipeline loads.
+
+    Returns the number of modules patched (for logging).
+    """
+    n = 0
+    for module in model.modules():
+        if hasattr(module, "fuse_swiglu"):
+            module.fuse_swiglu = False
+            n += 1
+    return n
+
+
 @torch.no_grad()
 def discover_prunable_layers(model: nn.Module, sample_batch: torch.Tensor) -> list[PrunableLayer]:
     """Return every prunable nn.Linear, in real forward-execution order.
 
     Args:
-        model: the full causal LM, already on the target device.
-        sample_batch: a small (batch, seqlen) input_ids tensor used only
-            to trace call order -- no gradients, nothing persisted.
+        model: the full causal LM (already on the target device). Call
+            `disable_fused_kernels(model)` first if the architecture might
+            use fused-linear kernels (see that function's docstring) --
+            this function has no way to detect a layer whose hook never
+            fires versus one that's genuinely unreachable.
+        sample_batch: a small ``(batch, seqlen)`` input_ids tensor used
+            purely to trace call order; no gradient, no persisted state.
     """
     blocks = get_decoder_blocks(model)
     candidates: dict[str, tuple[nn.Linear, int]] = {}

@@ -1,12 +1,17 @@
 """Calibration and perplexity-eval data.
 
-Calibration follows the standard convention in this line of work
-(SparseGPT, ELSA, etc.): 128 sequences of 2048 tokens each, drawn from
-C4's English training split, with a fixed seed for reproducibility.
+Calibration protocol matches the convention both background papers in
+this proposal use for their baselines (ELSA appendix B.2: "we follow the
+convention of Frantar & Alistarh (2023) [SparseGPT], sampling 128
+calibration sequences from the C4 dataset with sequence length 2048"):
 
-Perplexity is evaluated on WikiText-2's test split and a held-out slice
-of C4's validation split, disjoint from whatever was used for
-calibration.
+    128 sequences x 2048 tokens, drawn from C4's English "train" split,
+    fixed seed for reproducibility.
+
+Perplexity evaluation uses WikiText-2's test split (`wikitext-2-raw-v1`)
+and a held-out slice of C4's validation split, matching ELSA's
+Section B.1 evaluation protocol ("Perplexity is measured on the held-out
+(validation) C4 ... and WikiText2").
 """
 
 from __future__ import annotations
@@ -24,35 +29,31 @@ def get_c4_calibration(
     seqlen: int = 2048,
     seed: int = 0,
 ) -> torch.Tensor:
-    """n_samples x seqlen token_id sequences from C4's train split.
+    """128 x 2048 token_id sequences from C4 train, SparseGPT/ELSA-style.
 
-    Each sequence is a random contiguous seqlen-token crop from a random
-    long-enough C4 document, sampled with a fixed seed so runs are
-    reproducible.
+    Each sequence is a random contiguous `seqlen`-token crop from a
+    random long-enough C4 document, sampled with a fixed seed so runs are
+    exactly reproducible.
     """
     data = load_dataset("allenai/c4", "en", split="train", streaming=True)
     rng = random.Random(seed)
 
-    # C4 is streamed and effectively unbounded, so we build a candidate
-    # pool from a bounded number of raw documents rather than scanning
-    # until we've found enough that are long enough. Only a small
-    # fraction of C4 documents clear the seqlen bar, so bounding by
-    # "documents that qualified" instead of "documents scanned" makes the
-    # scan time blow up as n_samples grows -- bounding the raw scan
-    # directly keeps this predictable.
-    max_raw_docs = max(50_000, n_samples * 100)
+    samples = []
+    it = iter(data)
+    # Reservoir over a bounded prefix of the stream (C4 is enormous and
+    # streamed; scanning a bounded number of documents keeps this fast
+    # while still giving a fixed-seed, reproducible sample).
+    pool_size = max(2000, n_samples * 20)
     pool = []
-    n_scanned = 0
-    for doc in data:
-        n_scanned += 1
-        ids = tokenizer(doc["text"], return_tensors="pt").input_ids[0]
+    for doc in it:
+        text = doc["text"]
+        ids = tokenizer(text, return_tensors="pt").input_ids[0]
         if ids.shape[0] > seqlen:
             pool.append(ids)
-        if n_scanned >= max_raw_docs:
+        if len(pool) >= pool_size:
             break
 
     rng.shuffle(pool)
-    samples = []
     for ids in pool:
         if len(samples) >= n_samples:
             break
@@ -80,22 +81,17 @@ def get_c4_eval(
     seqlen: int = 2048,
     seed: int = 1,
 ) -> torch.Tensor:
-    """A held-out C4 validation slice for perplexity.
-
-    Uses a different split and a different seed than calibration, so it's
-    disjoint from whatever text calibration saw.
+    """A held-out C4 validation slice for perplexity, disjoint (different
+    split, different seed) from calibration.
     """
     data = load_dataset("allenai/c4", "en", split="validation", streaming=True)
     rng = random.Random(seed)
-    max_raw_docs = max(10_000, n_samples * 100)
     pool = []
-    n_scanned = 0
     for doc in data:
-        n_scanned += 1
         ids = tokenizer(doc["text"], return_tensors="pt").input_ids[0]
         if ids.shape[0] > seqlen:
             pool.append(ids)
-        if n_scanned >= max_raw_docs:
+        if len(pool) >= max(1000, n_samples * 10):
             break
     rng.shuffle(pool)
     samples = []

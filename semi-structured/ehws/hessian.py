@@ -1,16 +1,14 @@
-"""Calibration-data Hessian for the Z-step.
+"""Calibration-data Hessian accumulation for the Z-step.
 
-Each prunable layer's Z-step needs an estimate of how much the model's
-output changes when a given input feature is zeroed out. We use the
-same reconstruction Hessian SparseGPT and CWS use: the second-moment
-matrix of the layer's input activations, accumulated over calibration
-data,
+Both the CWS background (slide 17: ``H = X Xᵀ``) and the Proposed Work's
+Phase 1 Z-step (slide 39, Eq. 2: ``argmin (z_l - v_l)ᵀ H_l (z_l - v_l)``)
+use the standard SparseGPT/OBS reconstruction Hessian: the second-moment
+matrix of a layer's input activations over calibration data,
 
-    H = (2 / N) * sum_n x_n x_n^T
+    H_l = (2 / N) * sum_n x_n x_n^T
 
-We accumulate it with a forward pre-hook on the layer while calibration
-batches are run through the (possibly already partially pruned) network,
-so it reflects the layer's actual input distribution at prune time.
+accumulated with a forward pre-hook on the layer while calibration batches
+are fed through the (partially-pruned) network.
 """
 
 from __future__ import annotations
@@ -35,8 +33,8 @@ class LayerHessian:
         n = x.shape[0]
         if n == 0:
             return
-        # Running mean-of-outer-products so batches of different sizes
-        # combine correctly, regardless of how many samples came before.
+        # Running mean-of-outer-products update so batches of different
+        # sizes combine correctly (matches SparseGPT's streaming formula).
         self.H.mul_(self.n_samples / (self.n_samples + n))
         self.n_samples += n
         x = x * (2.0 / self.n_samples) ** 0.5
@@ -45,16 +43,38 @@ class LayerHessian:
     def hook(self, module: nn.Module, inputs) -> None:
         self.update(inputs[0])
 
-    def damped(self, damping: float = 0.01) -> torch.Tensor:
-        """H + damping * mean(diag(H)) * I.
+    def damped(self, damping: float = 0.01, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """H + damping * mean(diag(H)) * I, guarding against dead/zero-variance input channels.
 
-        Guards against input channels that never fired during
-        calibration (diagonal entry of exactly 0), which would otherwise
-        make that channel look infinitely important to keep.
+        Returned in `dtype` (float32 by default), not the float64 the
+        running accumulation itself uses -- accumulating thousands of
+        outer products in float64 is what avoids catastrophic-cancellation
+        error building up over the sum, but the *returned* matrix only
+        ever gets read afterward (ranking scores in `diagonal_project`,
+        upcast back to float32 there regardless -- or a Cholesky solve in
+        `obs_project`), so a smaller storage dtype here costs no
+        meaningful precision. This matters at real scale: a model with
+        many/wide prunable layers (e.g. HGRN-1.3B's 168 layers, some
+        d_in=5632) can need >10GB just to keep every finished layer's full
+        (d_in x d_in) Hessian resident in float64 -- `admm.py`'s
+        `_compute_hessian` passes the model's own load dtype here
+        (`--dtype` in run_pipeline.py) so H's storage footprint tracks
+        whatever the rest of the pipeline is using.
         """
         H = self.H.clone()
         idx = torch.arange(H.shape[0], device=H.device)
         dead = H[idx, idx] == 0
         H[dead, dead] = 1.0
         H[idx, idx] += damping * H[idx, idx].mean()
-        return H
+        return H.to(dtype)
+
+    def inverse(self, damping: float = 0.01) -> torch.Tensor:
+        """The *full* H^-1 needed by the CWS-style per-row greedy projection
+        (slide 30: "one upfront H^-1, then O(1) work per weight").
+        """
+        H = self.damped(damping)
+        L = torch.linalg.cholesky(H)
+        Hinv = torch.cholesky_inverse(L)
+        # Symmetrize away float rounding asymmetry before it compounds
+        # through thousands of greedy-elimination steps.
+        return 0.5 * (Hinv + Hinv.t())
