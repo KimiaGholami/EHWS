@@ -63,6 +63,26 @@ Zero-shot accuracy (7-task average, lm-evaluation-harness): dense 0.377,
 pruned 0.385 -- essentially unchanged, within the noise of a 7-task
 average this small.
 
+`fla-hub/hgrn-1.3B-100B`, 80% sparsity, `--p2-lr 6e-4 --adam-beta2 0.95`
+(both CE and KD active, `alpha_kd=0.5`):
+
+| | WikiText2 PPL | C4 PPL |
+|---|---|---|
+| Dense | 11.84 | 16.89 |
+| **This method (80% sparsity)** | **85.76** | **57.21** |
+| Real [ELSA](https://arxiv.org/abs/2510.01650)'s own published result, same model/sparsity (no KD, pure CE) | 54.08 | 36.92 |
+
+Zero-shot accuracy (7-task average): dense 0.435, pruned 0.357.
+
+This result only exists because of a direct audit against ELSA's own
+reference implementation run against this exact model -- its logged
+hyperparameters showed this package's ADMM penalty strength (`lambda`)
+had been tuned 200x too small for HGRN the entire time (`0.01` constant
+in real ELSA's measured run vs `5e-5` cosine-ramped here beforehand);
+fixing just that one value cut WikiText2 PPL by ~40% in isolation,
+before `lr`/`beta2` were retuned around it. See `ehws/hparams.py`'s
+module docstring and `PROGRESS.md` for the full comparison.
+
 Reproduce with:
 
 ```bash
@@ -96,13 +116,18 @@ rule, not a solved problem.
 Phase 2's `(lr, lambda, schedule)` per model/sparsity come from
 `ehws/hparams.py`, sourced from ELSA's own published values for the
 models it covers (OPT-125M, OPT-1.3B) -- see that file for the exact
-table and how the untabulated points were filled in. Phase 1 has no
-published reference (it's this method's own addition): ladder
-`[0.15, 0.30, 0.45, 0.60, 0.75, 0.90, 0.95]`, 2 rounds per rung, 4
-optimizer steps per round, `lr=2e-4`, `admm_lambda=5e-5`,
-`saturation_tau=0.15`. Both phases mix in a knowledge-distillation term
-at `alpha_kd=0.5`. Full config for any run is dumped verbatim into
-`results/<name>/results.json`.
+table and how the untabulated points were filled in. `fla-hub/hgrn-1.3B-100B`
+at 80% sparsity is the one entry backed by *measured* ground truth rather
+than an approximation: ELSA's own code was actually run against this
+model, and its logged hyperparameters (`lr=2e-4, lambda=0.01 constant`)
+replaced an earlier OPT-1.3B-table guess that turned out to be 200x too
+small on `lambda` -- every other HGRN sparsity still falls back to that
+same approximation. Phase 1 has no published reference (it's this
+method's own addition): ladder `[0.15, 0.30, 0.45, 0.60, 0.75, 0.90,
+0.95]`, 2 rounds per rung, 4 optimizer steps per round, `lr=2e-4`,
+`admm_lambda=5e-5`, `saturation_tau=0.15`. Both phases mix in a
+knowledge-distillation term at `alpha_kd=0.5`. Full config for any run
+is dumped verbatim into `results/<name>/results.json`.
 
 ## Calibration & evaluation
 
