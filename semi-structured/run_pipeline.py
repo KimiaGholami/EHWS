@@ -385,13 +385,24 @@ def main():
             # tie_word_embeddings=False, so there's no real weight aliasing to worry about --
             # save the raw state dict directly instead of going through save_pretrained().
             from safetensors.torch import save_file
+            # Move to CPU before serializing: building a contiguous state_dict copy
+            # while the model is still on GPU stacks on top of whatever GPU memory
+            # training/eval already used (observed as high as 38.4/40GB on this card),
+            # and a CUDA OOM at this point can kill the process before Python's
+            # traceback even gets flushed (a prior run died here with zero trace).
+            # 480GB system RAM makes CPU a much safer place to hold ~2.6GB of weights.
+            print(f"  moving model to CPU before saving...", flush=True)
+            model.to("cpu")
+            print(f"  building state_dict...", flush=True)
             state_dict = {k: v.contiguous() for k, v in model.state_dict().items()}
+            print(f"  writing safetensors to {save_dir}...", flush=True)
             save_file(state_dict, os.path.join(save_dir, "model.safetensors"))
             model.config.save_pretrained(save_dir)
             if getattr(model, "generation_config", None) is not None:
                 model.generation_config.save_pretrained(save_dir)
             tokenizer.save_pretrained(save_dir)
-            print(f"  model saved to {save_dir}")
+            model.to(device)
+            print(f"  model saved to {save_dir}", flush=True)
 
     if os.path.exists(p1_checkpoint_path):
         os.remove(p1_checkpoint_path)  # every requested sparsity finished successfully -- nothing left to resume
