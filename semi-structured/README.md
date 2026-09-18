@@ -63,26 +63,6 @@ Zero-shot accuracy (7-task average, lm-evaluation-harness): dense 0.377,
 pruned 0.385 -- essentially unchanged, within the noise of a 7-task
 average this small.
 
-`fla-hub/hgrn-1.3B-100B`, 80% sparsity, `--p2-lr 6e-4 --adam-beta2 0.95`
-(both CE and KD active, `alpha_kd=0.5`):
-
-| | WikiText2 PPL | C4 PPL |
-|---|---|---|
-| Dense | 11.84 | 16.89 |
-| **This method (80% sparsity)** | **85.76** | **57.21** |
-| Real [ELSA](https://arxiv.org/abs/2510.01650)'s own published result, same model/sparsity (no KD, pure CE) | 54.08 | 36.92 |
-
-Zero-shot accuracy (7-task average): dense 0.435, pruned 0.357.
-
-This result only exists because of a direct audit against ELSA's own
-reference implementation run against this exact model -- its logged
-hyperparameters showed this package's ADMM penalty strength (`lambda`)
-had been tuned 200x too small for HGRN the entire time (`0.01` constant
-in real ELSA's measured run vs `5e-5` cosine-ramped here beforehand);
-fixing just that one value cut WikiText2 PPL by ~40% in isolation,
-before `lr`/`beta2` were retuned around it. See `ehws/hparams.py`'s
-module docstring and `PROGRESS.md` for the full comparison.
-
 Reproduce with:
 
 ```bash
@@ -94,6 +74,90 @@ python run_pipeline.py --model facebook/opt-125m --sparsities 0.5 --out results/
 
 A single A100-40GB run takes on the order of a few hours for OPT-125M
 (most of it in Phase 2's 4096 optimizer steps).
+
+`fla-hub/hgrn-1.3B-100B`, 80% sparsity (both CE and KD active, `alpha_kd=0.5`):
+
+| | WikiText2 PPL | C4 PPL |
+|---|---|---|
+| Dense | 11.84 | 16.89 |
+| **Two-phase (this method, default)** | **85.76** | **57.21** |
+| **One-phase (`--skip-phase1` cold start)** | **57.10** | **41.39** |
+| Real [ELSA](https://arxiv.org/abs/2510.01650)'s own published result, same model/sparsity (no KD, pure CE) | 54.08 | 36.92 |
+
+Zero-shot accuracy (7-task average): dense 0.435, two-phase-pruned 0.357
+(not yet measured for the one-phase variant).
+
+Both results only exist because of a direct audit against ELSA's own
+reference implementation run against this exact model -- its logged
+hyperparameters showed this package's ADMM penalty strength (`lambda`)
+had been tuned 200x too small for HGRN the entire time (`0.01` constant
+in real ELSA's measured run vs `5e-5` cosine-ramped here beforehand);
+fixing just that one value cut WikiText2 PPL by ~40% in isolation,
+before `lr`/`beta2` were retuned around it. See `ehws/hparams.py`'s
+module docstring and `PROGRESS.md` for the full comparison.
+
+Once that fix was in, `--skip-phase1` (running Phase 2 straight from the
+dense model, matching real ELSA's own single-continuous-run architecture)
+turned out to beat the two-phase pipeline on both quality and wall-clock
+time -- see [Running HGRN-1.3B](#running-hgrn-13b-80-sparsity) below and
+`PROGRESS.md`'s Session 8 for the full ablation. Two-phase is kept as
+this project's own methodological contribution; one-phase is the better
+choice if you just want the best HGRN number this repo can produce.
+
+## Running HGRN-1.3B (80% sparsity)
+
+Assumes the venv from the OPT-125M quickstart above is already set up.
+
+**Two-phase (85.76 / 57.21 above):**
+
+```bash
+python run_pipeline.py --model fla-hub/hgrn-1.3B-100B \
+  --sparsities 0.8 --zeroshot-sparsities 0.8 \
+  --n-calib 2048 --seqlen 2048 --n-eval-c4 256 \
+  --micro-batch 2 --grad-accum 4 --p2-micro-batch 1 --p2-grad-accum 8 \
+  --dtype bfloat16 --gradient-checkpointing \
+  --no-auto-hparams --p2-lr 6e-4 --p2-lambda-max 0.01 --p2-lambda-schedule constant --adam-beta2 0.95 \
+  --out results/hgrn-1.3b-0.8
+```
+
+**One-phase (57.10 / 41.39 above)** -- same command plus `--skip-phase1`:
+
+```bash
+python run_pipeline.py --model fla-hub/hgrn-1.3B-100B \
+  --sparsities 0.8 --zeroshot-sparsities 0.8 \
+  --n-calib 2048 --seqlen 2048 --n-eval-c4 256 \
+  --micro-batch 2 --grad-accum 4 --p2-micro-batch 1 --p2-grad-accum 8 \
+  --dtype bfloat16 --gradient-checkpointing \
+  --no-auto-hparams --p2-lr 6e-4 --p2-lambda-max 0.01 --p2-lambda-schedule constant --adam-beta2 0.95 \
+  --skip-phase1 \
+  --out results/hgrn-1.3b-0.8-1phase
+```
+
+**Every non-default flag above is load-bearing, not cosmetic:**
+
+- `--no-auto-hparams --p2-lr 6e-4 --p2-lambda-max 0.01 --p2-lambda-schedule constant --adam-beta2 0.95` --
+  without this, `run_pipeline.py` falls back to `ehws/hparams.py`'s auto-hparams
+  table, which for HGRN@80% uses `lr=2e-4` (ELSA's raw, un-retuned value) and
+  the stock Adam `beta2=0.999`. That combination was actually run
+  (`results/hgrn-1.3b-lambdafix-lr2e-4/`) and scores **WT2 207.7 / C4 125.2**
+  -- 2-3x worse, with no warning or error. `lambda=0.01` is already correct
+  in the auto-hparams table; `lr` and `beta2` are not.
+- `--n-calib 2048` -- 2x this repo's own default (`1024`); n_calib was the
+  second-largest lever found for the OPT-125M-unstructured variant of this
+  method (`ehws/admm.py`'s module docstring), reused here without an
+  independent sweep.
+- `--dtype bfloat16 --gradient-checkpointing --p2-micro-batch 1 --p2-grad-accum 8`
+  -- memory only, no effect on the result. At 1.3B+ scale, float32 storage
+  and Phase 2's default micro-batch both measurably OOM on a 40GB GPU
+  (see the corresponding `--dtype`/`--p2-micro-batch` help text in
+  `run_pipeline.py`). Needs an A100-40GB-class GPU or better.
+
+**Runtime and reproducibility:** two-phase takes ~11-12h wall-clock
+(Phase 1 ~7.5h + Phase 2 ~4h); one-phase (`--skip-phase1`) takes ~6-7h.
+Expect small run-to-run variance, not bit-exact reproduction -- a repeat
+of the exact two-phase command above landed at WT2 88.23 / C4 56.79
+instead of 85.76 / 57.21, attributed to `bfloat16` non-determinism
+(see `PROGRESS.md`'s Session 7).
 
 ## Known limitation
 
@@ -119,10 +183,23 @@ models it covers (OPT-125M, OPT-1.3B) -- see that file for the exact
 table and how the untabulated points were filled in. `fla-hub/hgrn-1.3B-100B`
 at 80% sparsity is the one entry backed by *measured* ground truth rather
 than an approximation: ELSA's own code was actually run against this
-model, and its logged hyperparameters (`lr=2e-4, lambda=0.01 constant`)
-replaced an earlier OPT-1.3B-table guess that turned out to be 200x too
-small on `lambda` -- every other HGRN sparsity still falls back to that
-same approximation. Phase 1 has no published reference (it's this
+model, and its logged hyperparameters (`lr=2e-4, lambda=0.01 constant,
+beta2=0.95`) replaced an earlier OPT-1.3B-table guess that turned out to
+be 200x too small on `lambda` -- every other HGRN sparsity still falls
+back to that same approximation.
+
+**The auto-hparams table's `lr=2e-4` is ELSA's raw value, not what this
+repo's headline HGRN results use.** Because this project's objective
+mixes in a KD term ELSA's doesn't have (`f = 0.5*CE + 0.5*KD` vs ELSA's
+pure CE), the effective task-loss gradient is diluted relative to
+ELSA's own tuning assumption; retuning `lr` to `6e-4` (3x) to compensate,
+on top of the corrected `lambda`, is what actually produced 85.76/57.21
+and 57.10/41.39 above. `beta2=0.95` is a plain manual override -- it has
+no auto-hparams table entry at all and silently defaults to PyTorch's
+stock `0.999` if you forget it. See
+[Running HGRN-1.3B](#running-hgrn-13b-80-sparsity) for the exact flags
+this actually requires, and `ehws/hparams.py`'s module docstring for the
+full numeric comparison. Phase 1 has no published reference (it's this
 method's own addition): ladder `[0.15, 0.30, 0.45, 0.60, 0.75, 0.90,
 0.95]`, 2 rounds per rung, 4 optimizer steps per round, `lr=2e-4`,
 `admm_lambda=5e-5`, `saturation_tau=0.15`. Both phases mix in a
