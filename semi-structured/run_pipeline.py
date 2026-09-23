@@ -88,6 +88,13 @@ def parse_args():
     p.add_argument("--p1-x-steps", type=int, default=4)
     p.add_argument("--p1-lr", type=float, default=2e-4)
     p.add_argument("--p1-lambda", type=float, default=5e-5)
+    p.add_argument(
+        "--p1-lambda-schedule", choices=["cosine", "constant"], default="cosine",
+        help="Phase 1's ADMM penalty schedule. 'cosine' (default, original behavior) ramps 0 -> "
+             "--p1-lambda per layer. Phase 1's default 5e-5 is the same value that was 200x too small "
+             "for Phase 2 (PROGRESS.md Session 5); pair 'constant' with Phase 2's own lambda (e.g. "
+             "--p1-lambda 1e-3 for OPT-125M @80%%) to test Phase 1 at a real penalty.",
+    )
     p.add_argument("--p1-max-grad-norm", type=float, default=1.0)
 
     # Phase 2 hyperparameters -- rounds*x_steps=4096 steps, x_steps=32 is
@@ -106,6 +113,14 @@ def parse_args():
              "--no-auto-hparams override couldn't express until this flag was added.",
     )
     p.add_argument("--p2-max-grad-norm", type=float, default=1.0)
+    p.add_argument(
+        "--p2-dual-init", choices=["carry", "rescale", "zero"], default="carry",
+        help="how Phase 1's scaled dual u enters Phase 2 (see ehws/admm.py's Phase2Config.dual_init). "
+             "'carry' (default, original behavior) hands u over as-is, so the real dual lambda*u jumps "
+             "by lambda_p2/lambda_p1 at the handoff; 'rescale' keeps lambda*u unchanged; 'zero' resets "
+             "u. No effect with --skip-phase1 (u starts at 0 there). Phase-2-only, so a saved Phase 1 "
+             "checkpoint can be reused across all three.",
+    )
 
     p.add_argument("--micro-batch", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=4)  # effective batch = micro_batch * grad_accum
@@ -128,6 +143,19 @@ def parse_args():
              "purely an EHWS addition (ehws/losses.py's combined_loss docstring has the full derivation).",
     )
     p.add_argument("--damping", type=float, default=0.01)
+    p.add_argument(
+        "--hessian-n-calib", type=int, default=None,
+        help="measure each layer's Hessian on only the first N calibration sequences instead of all "
+             "--n-calib of them (default: all, the original behavior). Hessian passes were ~half of "
+             "Phase 1's compute at --n-calib 2048; the diagonal the default Z-step uses converges with "
+             "a few hundred sequences (e.g. 256).",
+    )
+    p.add_argument(
+        "--full-hessian", action="store_true",
+        help="store full d_in x d_in Hessians even for --zstep diagonal/magnitude, which only read "
+             "the diagonal (default: diagonal only for those two, full matrices for obs_select/"
+             "obs_correct). Same Z-step result either way up to float rounding; only for checking that.",
+    )
     p.add_argument(
         "--adam-beta1", type=float, default=0.9, help="Adam beta1 for both Phase 1 and Phase 2's optimizer",
     )
@@ -295,10 +323,18 @@ def main():
         checkpoint_dir = os.path.join(scratch, "ehws-checkpoints", os.path.basename(os.path.normpath(args.out))) if scratch else args.out
     os.makedirs(checkpoint_dir, exist_ok=True)
     p1_checkpoint_path = os.path.join(checkpoint_dir, "phase1_checkpoint.pt")
+    diag_only = args.zstep in ("diagonal", "magnitude") and not args.full_hessian
     p1_meta = {
         "model": args.model, "dtype": args.dtype, "seed": args.seed,
         "skip_phase1": args.skip_phase1,
         "p1_target_sparsity": None if args.skip_phase1 else args.p1_target_sparsity,
+        # Everything else Phase 1's output depends on, so a checkpoint from a
+        # different Phase 1 config is rejected instead of silently reused.
+        "p1": None if args.skip_phase1 else {
+            "lambda": args.p1_lambda, "lambda_schedule": args.p1_lambda_schedule, "lr": args.p1_lr,
+            "rounds": args.p1_rounds, "x_steps": args.p1_x_steps, "zstep": args.zstep,
+        },
+        "hessian_n_calib": args.hessian_n_calib,
         # Not used for anything except the checkpoint-compatibility check below,
         # but the H recompute in load_phase1_checkpoint depends on all three
         # matching exactly (they determine calib_ids and the Hessian damping) --
@@ -312,12 +348,16 @@ def main():
         phase1_states = load_phase1_checkpoint(
             p1_checkpoint_path, layers, device, p1_meta,
             model, calib_ids, args.seqlen, args.damping,
+            hessian_n_calib=args.hessian_n_calib, diag_only=diag_only,
         )
         print(f"Checkpoint loaded in {time.time()-t0:.1f}s")
         results["phase1_summary"] = "loaded from checkpoint"
     elif args.skip_phase1:
         print("=" * 30, "PHASE 1: SKIPPED (--skip-phase1 cold-start ablation)", "=" * 30)
-        phase1_states = build_dense_states(model, layers, calib_ids, args.seqlen, device, args.damping)
+        phase1_states = build_dense_states(
+            model, layers, calib_ids, args.seqlen, device, args.damping,
+            hessian_n_calib=args.hessian_n_calib, diag_only=diag_only,
+        )
         print(f"Cold-start Hessians computed in {time.time()-t0:.1f}s")
         results["phase1_summary"] = "skipped (--skip-phase1 cold-start ablation)"
         save_phase1_checkpoint(phase1_states, p1_checkpoint_path, p1_meta)
@@ -327,8 +367,10 @@ def main():
         p1_cfg = Phase1Config(
             target_sparsity=args.p1_target_sparsity, rounds=args.p1_rounds, x_steps=args.p1_x_steps,
             micro_batch=args.micro_batch, grad_accum=args.grad_accum, lr=args.p1_lr,
-            admm_lambda_max=args.p1_lambda, alpha_kd=args.alpha_kd, kd_temperature=args.kd_temperature,
-            damping=args.damping, seqlen=args.seqlen, max_grad_norm=args.p1_max_grad_norm,
+            admm_lambda_max=args.p1_lambda, lambda_schedule=args.p1_lambda_schedule,
+            alpha_kd=args.alpha_kd, kd_temperature=args.kd_temperature,
+            damping=args.damping, hessian_n_calib=args.hessian_n_calib, diag_only_hessian=diag_only,
+            seqlen=args.seqlen, max_grad_norm=args.p1_max_grad_norm,
             beta1=args.adam_beta1, beta2=args.adam_beta2, prox_after_clip=args.prox_after_clip,
         )
         phase1_states = run_phase1(model, teacher, layers, calib_ids, p1_cfg, device, zstep_fn=ZSTEP_FNS[args.zstep])
@@ -375,7 +417,7 @@ def main():
             lr=lr,
             admm_lambda_max=lam, lambda_schedule=schedule, alpha_kd=args.alpha_kd,
             kd_temperature=args.kd_temperature, seqlen=args.seqlen,
-            max_grad_norm=args.p2_max_grad_norm,
+            max_grad_norm=args.p2_max_grad_norm, dual_init=args.p2_dual_init,
             beta1=args.adam_beta1, beta2=args.adam_beta2, prox_after_clip=args.prox_after_clip,
         )
         t0 = time.time()

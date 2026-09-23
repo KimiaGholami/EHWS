@@ -18,12 +18,25 @@ import torch.nn as nn
 
 
 class LayerHessian:
-    """Accumulates H = (2/N) X^T X for one nn.Linear's input activations."""
+    """Accumulates H = (2/N) X^T X for one nn.Linear's input activations.
 
-    def __init__(self, in_features: int, device: torch.device):
+    ``diag_only=True`` accumulates just ``diag(H)`` (a length-``d_in``
+    vector, ``(2/N) * sum_n x_n**2``) instead of the full ``d_in x d_in``
+    matrix. That's everything the ``diagonal``/``magnitude`` Z-steps ever
+    read (see `diagonal_projection.py`), and it's the same float64
+    streaming sum as the full matrix's diagonal -- equal up to float
+    rounding, not an approximation. Costs O(d_in) memory instead of
+    O(d_in^2) -- e.g. HGRN-1.3B's ~11GB of resident Phase 2 Hessians
+    shrinks to a few MB. `obs_select`/`obs_correct` need off-diagonal
+    entries and must keep ``diag_only=False``.
+    """
+
+    def __init__(self, in_features: int, device: torch.device, diag_only: bool = False):
         self.device = device
         self.d_in = in_features
-        self.H = torch.zeros((in_features, in_features), device=device, dtype=torch.float64)
+        self.diag_only = diag_only
+        shape = (in_features,) if diag_only else (in_features, in_features)
+        self.H = torch.zeros(shape, device=device, dtype=torch.float64)
         self.n_samples = 0
 
     @torch.no_grad()
@@ -38,7 +51,10 @@ class LayerHessian:
         self.H.mul_(self.n_samples / (self.n_samples + n))
         self.n_samples += n
         x = x * (2.0 / self.n_samples) ** 0.5
-        self.H.add_(x.t() @ x)
+        if self.diag_only:
+            self.H.add_(x.pow(2).sum(dim=0))
+        else:
+            self.H.add_(x.t() @ x)
 
     def hook(self, module: nn.Module, inputs) -> None:
         self.update(inputs[0])
@@ -62,6 +78,11 @@ class LayerHessian:
         whatever the rest of the pipeline is using.
         """
         H = self.H.clone()
+        if self.diag_only:
+            # Same damping as the full-matrix branch below, applied to the diagonal vector.
+            H[H == 0] = 1.0
+            H += damping * H.mean()
+            return H.to(dtype)
         idx = torch.arange(H.shape[0], device=H.device)
         dead = H[idx, idx] == 0
         H[dead, dead] = 1.0
@@ -72,6 +93,8 @@ class LayerHessian:
         """The *full* H^-1 needed by the CWS-style per-row greedy projection
         (slide 30: "one upfront H^-1, then O(1) work per weight").
         """
+        if self.diag_only:
+            raise ValueError("inverse() needs the full Hessian -- construct LayerHessian with diag_only=False")
         H = self.damped(damping)
         L = torch.linalg.cholesky(H)
         Hinv = torch.cholesky_inverse(L)

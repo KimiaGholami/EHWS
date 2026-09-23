@@ -1260,3 +1260,94 @@ Two things this confirms: (1) `relax_alpha` is genuinely wired through and activ
 ### Not yet tried: adaptive/residual-balancing penalty (proposed, not yet run)
 
 Floated as the next candidate for a genuine two-phase-preserving, ELSA-differentiating, Phase-2-only mathematical change: classic ADMM residual-balancing adjusts the penalty parameter (`admm_lambda`, this project's rho) each round based on the primal/dual residual ratio, instead of the current fixed schedule (constant or cosine-ramped). Doesn't touch the Z-step's hard projection the way over-relaxation did, so it may not hit the same failure mode. Not implemented or tested yet -- next natural candidate if this direction is pursued further.
+
+## Session 10 (2026-09-23): Phase 1 -> Phase 2 handoff fixes and faster Hessians (implemented, verified on a toy model, not yet run on GPU)
+
+Goal: keep two-phase (user's decision, Session 9) but make it cheaper and stop Phase 1 from hurting Phase 2. Two changes, both opt-in or exact, so existing configs reproduce unchanged.
+
+### 1. Handoff: Phase 1's dual is the wrong size for Phase 2
+
+- **Phase 1 still had the "λ 200x too small" setting.** `--p1-lambda` defaults to 5e-5 with a cosine ramp, the same value fixed for Phase 2 in Session 5 but never revisited for Phase 1. With almost no penalty, `u = Σ(x - z)` just accumulates the pruned mass every round. On a toy OPT model, the default Phase 1 hands Phase 2 a dual with `max ||u||/||x0|| = 2.02`, which matches the 2.01 logged at Phase 2 round 1 on real OPT-125M (Session 9 relaxed-ADMM table).
+- **`u` is the scaled dual** (the real dual is `λ·u`, and the proximal target is `z - u`), but it was handed over without rescaling. Moving from λ=5e-5 to 1e-3 (OPT-125M) or 1e-2 (HGRN) multiplies the real dual by 20x or 200x at the handoff. Likely explains both "two-phase is worse than one-phase" and "Phase 2 can't be shortened after the warm start" (Session 9 step-cut sweep). Still a hypothesis, not a measured result.
+- New flags:
+  - `--p2-dual-init {carry,rescale,zero}` (default `carry` = old behavior). `rescale` multiplies `u` by `λ_p1/λ_p2`; `zero` keeps Phase 1's x/z and starts a fresh dual. `LayerState.admm_lambda` records the penalty `u` was built under (saved in the checkpoint; old checkpoints load it as 0, which leaves `rescale` as a no-op).
+  - `--p1-lambda-schedule {cosine,constant}` (default `cosine` = old behavior).
+- Not applied to `relaxed_admm/`: `run_phase2_relaxed` builds its own Phase 2 state.
+
+### 2. Hessians: cheaper and smaller, same results
+
+- `diagonal`/`magnitude` only ever read `diag(H)`. `LayerHessian(diag_only=True)` accumulates just that vector. It's now automatic for those two Z-steps (`--full-hessian` turns it off). Phase 2 no longer holds every layer's full d_in×d_in H on the GPU (≈11GB on HGRN-1.3B, now a few MB).
+- `_compute_hessians`: hooks many layers in one pass, and stops each batch's forward pass as soon as every hooked layer has seen its input (skipping later blocks and the lm_head). Exact.
+  - `build_dense_states` (`--skip-phase1`): one pass for all layers instead of one full pass per layer (168 passes → 1 on HGRN). This is almost certainly the unexplained ~4h found in Session 8's one-phase run.
+  - `run_phase1` / checkpoint reload: still one layer at a time (each layer must be measured after the previous one is pruned), but now with early exit.
+- `--hessian-n-calib N` (default: all, the old behavior) measures H on the first N calibration sequences. This one *is* an approximation. At `--n-calib 2048`, the per-layer Hessian passes were roughly half of Phase 1's compute.
+- **Verification** (random 3-layer OPT, CPU, original code vs new code in separate processes): Phase 1 x/z/u and Phase 2 z were bit-identical, both with full and diagonal-only H. Cold-start H matched exactly; decoder-block forward calls for the cold-start pass dropped from 216 to 12. `dual_init` scaled the initial dual exactly (1.0 / 0.1 / 0). Checkpoint round trip matched.
+- The checkpoint `meta` now also records Phase 1's lambda/schedule/lr/rounds/x_steps/zstep and `hessian_n_calib`, so older `phase1_checkpoint.pt` files will be rejected (they're normally deleted on success anyway).
+
+### Fixed: Phase 1's trained biases weren't saved in the checkpoint
+
+`_x_step` optimizes each layer's `bias` along with its `weight` (confirmed: all 18/18 toy-OPT layers' biases change in Phase 1). `save_phase1_checkpoint` saved only x/z/u, so a run resumed from a checkpoint started Phase 2, and recomputed every later layer's H, with the dense model's biases. That affected any resumed OPT run (OPT linears have biases). **Fix:** the checkpoint now stores each layer's trained bias, and `load_phase1_checkpoint` restores it during the H replay (after that layer's own H, matching the order `run_phase1` measured in). Checkpoints without a `bias` key keep the old behavior. **Verified** on the toy model: a resumed run gives the same biases, the same H, and the same Phase 2 z and final biases as a run that never stopped.
+
+**Keep training biases -- real ELSA does too, and more.** `ELSA-official/lib/trainer.py::create_optimizer` (checked at github.com/log-postech/elsa `03322d6`) puts every parameter with `requires_grad` into the optimizer. The `nn.Linear` weights (except lm_head) form the ADMM group; everything else goes in an `other_params` group that gets plain Adam with no proximal term. Nothing in `main.py`/`lib/utils.py` freezes anything, so ELSA also trains **LayerNorms, embeddings, and the lm_head**. EHWS trains only the prunable linears' weights and biases (everything else is frozen in `run_pipeline.py`). That's a real, untested difference from ELSA, and a possible quality lever for Phase 2 (costs extra Adam memory for embeddings/lm_head). Not changed.
+
+### NEXT GPU SESSION: runbook for testing Session 10 (OPT-125M @80%, 4 GPUs, ~4-5h)
+
+**Goal**: find out whether (a) `--hessian-n-calib 256` makes Phase 1 faster without hurting quality, and (b) fixing the Phase 1 -> Phase 2 handoff makes two-phase better, and then whether it lets Phase 2 run fewer rounds (the way two-phase could match ELSA's time).
+
+**Reference numbers (Session 9, same model/sparsity/calibration; WT2 / C4 PPL, lower is better):**
+- Two-phase, 128 rounds: **84.79 / 52.55** (Phase 1 ~9240s, Phase 2 ~5240s)
+- One-phase (`--skip-phase1`), 128 rounds: **80.69 / 50.21**
+- Two-phase, 64 rounds: 98.82 / 57.85; 32 rounds: 129.49 / 70.78
+
+**Before launching:**
+- Pull the latest code (`git pull` in `EHWS/`). Session 10 changes are in `ehws/admm.py`, `ehws/hessian.py`, `ehws/diagonal_projection.py`, `run_pipeline.py`.
+- Start a fresh OnDemand session with most of its 48h walltime left (see Session 3/5 silent-death notes).
+- The calibration cache from Session 9 (`/anvil/scratch/x-kgholami/ehws-calib-cache`) should already hold the n=2048 set. If it's missing, build it once in a single process first (~39min) rather than letting 4 arms build it at the same time on the 1 CPU core.
+- Old `phase1_checkpoint.pt` files will be rejected (the checkpoint meta now records Phase 1's settings). That's expected, not an error; delete them or use new `--out` names (below).
+- Use `python3 -u` so `run.log` isn't block-buffered (Session 4 finding) and the `Phase 1 complete in ...s` / `Phase 2 ... complete in ...s` timing lines show up live.
+
+**Launch (one arm per GPU):**
+```
+cd /home/x-kgholami/Weight-Sparsity-Using-Real-Loss/EHWS/semi-structured
+PY=/home/x-kgholami/Weight-Sparsity-Using-Real-Loss/Extreme_Layer_Global_Pruning_Unstructured/.venv/bin/python3
+COMMON="--model facebook/opt-125m --sparsities 0.8 --zeroshot-sparsities 0.8 --n-calib 2048 \
+  --calib-cache /anvil/scratch/x-kgholami/ehws-calib-cache --hessian-n-calib 256"
+launch() {  # $1 = GPU, $2 = run name, rest = extra flags
+  gpu=$1; name=$2; shift 2; mkdir -p results/$name
+  CUDA_VISIBLE_DEVICES=$gpu setsid nohup $PY -u run_pipeline.py $COMMON "$@" --out results/$name \
+    > results/$name/run.log 2>&1 < /dev/null & disown
+}
+launch 0 opt-125m-s10-hess256
+launch 1 opt-125m-s10-dualzero    --p2-dual-init zero
+launch 2 opt-125m-s10-dualrescale --p2-dual-init rescale
+launch 3 opt-125m-s10-p1lam-const --p1-lambda 1e-3 --p1-lambda-schedule constant --p2-dual-init rescale
+```
+(Auto-hparams supplies Phase 2's `lr=6e-4, lambda=1e-3, constant`, same as Session 9. That's why arm 3 sets Phase 1's lambda to 1e-3: both phases then use the same penalty.)
+
+**What each arm answers:**
+
+| GPU | Run | Question | Compare to |
+|---|---|---|---|
+| 0 | `s10-hess256` | Does Hessian subsampling keep quality? How much faster is Phase 1? | Two-phase 84.79/52.55 and Phase 1 ~9240s |
+| 1 | `s10-dualzero` | Is the oversized inherited dual what hurts two-phase? | Arm 0 (same Hessian setting, so it's the fair baseline) |
+| 2 | `s10-dualrescale` | Same, but keep the dual's direction at the correct size | Arm 0 |
+| 3 | `s10-p1lam-const` | Does Phase 1 with a real penalty give a useful warm start? | Arm 0 |
+
+**Check progress / results:**
+```
+pgrep -af "run_pipeline.py"
+for d in results/opt-125m-s10-*; do echo "-- $d"; grep -E "Phase 1 complete|Phase 2 .*complete|achieved_sparsity|Traceback|Error" $d/run.log; done
+```
+Also check that Phase 2's round-1 `max ||u||/||x0||` in `run.log` has dropped from ~2.0 (Session 9) in arms 1-3. That's the direct sign the handoff fix is doing what it should.
+
+**How to decide:**
+1. **Arm 0 vs 84.79/52.55:** if quality holds (within ~2-3%), keep `--hessian-n-calib 256` for all future runs and record the Phase 1 time saved. If it's clearly worse, try 512.
+2. **Arms 1-3 vs arm 0:** if one wins on both WT2 and C4, make that setting the default in code (`Phase2Config.dual_init` / `--p1-lambda-schedule`), the same way `prox_after_clip` was promoted in Session 5.
+3. **Winner vs one-phase 80.69/50.21:** if a two-phase arm beats it, two-phase beats ELSA's architecture on quality, not just by being different.
+4. **Then the step-cut test** (the real question): rerun the winning arm with `--p2-rounds 64` and `--p2-rounds 32` (2 GPUs). If quality stays near its 128-round number (unlike Session 9's 98.82/129.49 collapse), a good warm start lets Phase 2 be shorter. That's how two-phase can fit in ELSA's time.
+5. If no arm beats arm 0, the handoff isn't the problem. Next candidates: residual-balancing lambda (Session 9), and training LayerNorms/embeddings/lm_head like ELSA (see the bias section above).
+6. Once OPT-125M shows a winner, repeat it on HGRN-1.3B (~12h per run, needs `--dtype bfloat16 --gradient-checkpointing --p2-micro-batch 1 --p2-grad-accum 8`, and HGRN's Phase 2 lambda is 1e-2, so `--p1-lambda 1e-2` for the arm-3 setting).
+
+Record every result back in this file.
+
+**Why not run this on a laptop:** timed on an M1 Pro (2026-09-23), one OPT-125M Phase 2 step at seqlen 2048 / batch 8 takes 27s on CPU and 212s on MPS (likely memory pressure from full-vocab logits in 16GB), vs ~1.3s on an A100. That's ~31h for Phase 2 alone on CPU, 2-3 days per arm with Phase 1. It needs the GPUs.

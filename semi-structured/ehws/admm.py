@@ -83,6 +83,11 @@ class LayerState:
     n_out: int
     x0_norm: float
     final_sparsity: float = 0.0
+    # Penalty in effect when `u` was last updated. `u` is ADMM's *scaled*
+    # dual (the real dual is admm_lambda * u), so handing `u` to a phase
+    # with a different penalty changes the dual's actual strength unless
+    # it's rescaled -- see Phase2Config.dual_init. 0.0 = no dual yet.
+    admm_lambda: float = 0.0
 
 
 def save_phase1_checkpoint(states: dict[str, "LayerState"], path: str, meta: dict) -> None:
@@ -118,8 +123,13 @@ def save_phase1_checkpoint(states: dict[str, "LayerState"], path: str, meta: dic
         "layers": {
             name: {
                 "x": s.x.cpu(), "z": s.z.cpu().to_sparse(), "u": s.u.cpu(),
+                # Phase 1 trains each layer's bias along with its weight (as real
+                # ELSA does -- its optimizer trains every non-frozen parameter,
+                # ADMM only constrains the weights), so the live bias is part of
+                # Phase 1's output too.
+                "bias": None if s.module.bias is None else s.module.bias.detach().cpu().clone(),
                 "n_in": s.n_in, "n_out": s.n_out, "x0_norm": s.x0_norm,
-                "final_sparsity": s.final_sparsity,
+                "final_sparsity": s.final_sparsity, "admm_lambda": s.admm_lambda,
             }
             for name, s in states.items()
         },
@@ -132,7 +142,7 @@ def save_phase1_checkpoint(states: dict[str, "LayerState"], path: str, meta: dic
 def load_phase1_checkpoint(
     path: str, layers: list["PrunableLayer"], device, meta: dict,
     model: nn.Module, calib_ids: torch.Tensor, seqlen: int, damping: float,
-    log_fn=print,
+    log_fn=print, hessian_n_calib: int | None = None, diag_only: bool = False,
 ) -> dict[str, "LayerState"]:
     """Load a checkpoint saved by `save_phase1_checkpoint`, re-associating
     each saved layer's tensors with the corresponding (freshly-loaded)
@@ -175,6 +185,7 @@ def load_phase1_checkpoint(
             x=d["x"].to(device), z=d["z"].to_dense().to(device), u=d["u"].to(device),
             H=None,
             n_in=d["n_in"], n_out=d["n_out"], x0_norm=d["x0_norm"], final_sparsity=d["final_sparsity"],
+            admm_lambda=d.get("admm_lambda", 0.0),
         )
         states[name] = state
 
@@ -185,8 +196,17 @@ def load_phase1_checkpoint(
         # (untouched by this loop so far -- only earlier layers were committed
         # to `z` below) -- exactly the state `run_phase1`/`build_dense_states`
         # measured H against originally, before this layer's own ADMM run.
-        s.H = _compute_hessian(model, pl.module, calib_ids, seqlen, device, damping).to(device)
+        s.H = _compute_hessian(
+            model, pl.module, calib_ids, seqlen, device, damping,
+            n_samples=hessian_n_calib, diag_only=diag_only,
+        ).to(device)
         pl.module.weight.data.copy_(s.z)  # commit to the pruned value before the next layer's forward pass measures its H
+        # Restore the trained bias too: run_phase1 measured every later layer's H
+        # with this layer's bias already trained. Checkpoints saved before biases
+        # were stored have no "bias" key and keep the dense bias (the old behavior).
+        bias = payload["layers"][pl.name].get("bias")
+        if bias is not None and pl.module.bias is not None:
+            pl.module.bias.data.copy_(bias.to(device=pl.module.bias.device, dtype=pl.module.bias.dtype))
         log_fn(f"  [{li+1}/{len(layers)}] {pl.name}: Hessian recomputed")
 
     for pl in layers:
@@ -218,9 +238,16 @@ class Phase1Config:
     grad_accum: int = 4
     lr: float = 2e-4
     admm_lambda_max: float = 5e-5
+    # "cosine" (ramp 0 -> admm_lambda_max, original behavior) or "constant".
+    # 5e-5/cosine is the same value found 200x too small for HGRN's Phase 2
+    # in Session 5 -- never revisited for Phase 1. See PROGRESS.md Session 10.
+    lambda_schedule: str = "cosine"
     alpha_kd: float = 0.5
     kd_temperature: float = 1.0  # 1.0 = untempered KD (original behavior); see losses.py's combined_loss
     damping: float = 0.01
+    # Calibration sequences used per Hessian (None = all of them). See _compute_hessians.
+    hessian_n_calib: int | None = None
+    diag_only_hessian: bool = False
     seqlen: int = 2048
     max_grad_norm: float = 1.0  # matches real ELSA's clip_grad_norm_ default (HF TrainingArguments convention)
     beta1: float = 0.9
@@ -244,6 +271,14 @@ class Phase2Config:
     lr: float = 1e-4
     admm_lambda_max: float = 5e-5
     lambda_schedule: str = "cosine"  # "cosine" (ramp 0->max, ELSA's OPT-1.3B+ convention) or "constant" (ELSA's OPT-125M/Gemma-2-2B convention)
+    # How Phase 1's scaled dual `u` enters Phase 2:
+    #   "carry"   -- as-is (original behavior). Phase 1's penalty (5e-5 by
+    #                default) is far below Phase 2's, so the real dual
+    #                (lambda * u) jumps by lambda_p2/lambda_p1 at the handoff.
+    #   "rescale" -- u *= lambda_p1 / admm_lambda_max, keeping the real dual
+    #                unchanged across the handoff.
+    #   "zero"    -- u = 0; Phase 2 keeps Phase 1's x and z but starts a fresh dual.
+    dual_init: str = "carry"
     alpha_kd: float = 0.5
     kd_temperature: float = 1.0  # 1.0 = untempered KD (original behavior); see losses.py's combined_loss
     seqlen: int = 2048
@@ -435,17 +470,76 @@ def _x_step(
     return opt
 
 
+class _StopForward(Exception):
+    """Raised from a Hessian hook once every hooked layer has seen its input,
+    so the rest of the forward pass (later blocks, lm_head) is skipped."""
+
+
 @torch.no_grad()
-def _compute_hessian(model: nn.Module, module: nn.Linear, calib_ids: torch.Tensor, seqlen: int, device, damping: float) -> torch.Tensor:
-    hess = LayerHessian(module.weight.shape[1], device)
-    handle = module.register_forward_pre_hook(hess.hook)
+def _compute_hessians(
+    model: nn.Module,
+    modules: list[nn.Linear],
+    calib_ids: torch.Tensor,
+    device,
+    damping: float,
+    n_samples: int | None = None,
+    diag_only: bool = False,
+) -> list[torch.Tensor]:
+    """Damped Hessians for every module in ``modules`` from one calibration pass.
+
+    Three speedups over measuring each layer with its own full-model pass:
+
+    - All of ``modules`` are hooked at once, so N layers cost one pass
+      instead of N. Only valid when none of them changes weight between
+      measurements -- true for `build_dense_states` (nothing is pruned
+      there), not for `run_phase1` (each layer is pruned before the next
+      one is measured), which still passes one module at a time.
+    - Each batch's forward pass stops as soon as every hooked module has
+      seen its input (`_StopForward`), skipping every later block and the
+      lm_head. Nothing downstream of the last hooked layer can affect its
+      input, so this is exact.
+    - ``n_samples`` measures on only the first ``n_samples`` calibration
+      sequences (``None`` = all of them, the original behavior). This one
+      is an approximation; a diagonal converges quickly, so a few hundred
+      2048-token sequences is plenty.
+
+    ``diag_only`` returns ``(d_in,)`` diagonals instead of full matrices
+    (see `LayerHessian`).
+    """
+    hessians = [LayerHessian(m.weight.shape[1], device, diag_only=diag_only) for m in modules]
+    pending: set[int] = set()
+
+    def make_hook(i: int, hess: LayerHessian):
+        def hook(module, inputs):
+            hess.update(inputs[0])
+            pending.discard(i)
+            if not pending:
+                raise _StopForward
+        return hook
+
+    handles = [m.register_forward_pre_hook(make_hook(i, h)) for i, (m, h) in enumerate(zip(modules, hessians))]
     model.eval()
+    ids = calib_ids if n_samples is None else calib_ids[:n_samples]
     batch_size = 4
-    for i in range(0, calib_ids.shape[0], batch_size):
-        batch = calib_ids[i : i + batch_size].to(device)
-        model(input_ids=batch, use_cache=False)
-    handle.remove()
-    return hess.damped(damping=damping, dtype=module.weight.dtype)
+    try:
+        for i in range(0, ids.shape[0], batch_size):
+            pending.update(range(len(modules)))
+            batch = ids[i : i + batch_size].to(device)
+            try:
+                model(input_ids=batch, use_cache=False)
+            except _StopForward:
+                pass
+    finally:
+        for h in handles:
+            h.remove()
+    return [h.damped(damping=damping, dtype=m.weight.dtype) for m, h in zip(modules, hessians)]
+
+
+def _compute_hessian(
+    model: nn.Module, module: nn.Linear, calib_ids: torch.Tensor, seqlen: int, device, damping: float,
+    n_samples: int | None = None, diag_only: bool = False,
+) -> torch.Tensor:
+    return _compute_hessians(model, [module], calib_ids, device, damping, n_samples=n_samples, diag_only=diag_only)[0]
 
 
 def build_dense_states(
@@ -456,6 +550,8 @@ def build_dense_states(
     device,
     damping: float,
     log_fn=print,
+    hessian_n_calib: int | None = None,
+    diag_only: bool = False,
 ) -> dict[str, LayerState]:
     """Cold-start ablation: build Phase 2's warm-start dict directly from
     the dense model (x=z=x0, u=0), skipping Phase 1 entirely.
@@ -468,17 +564,38 @@ def build_dense_states(
     ablation, same rationale, adapted for this package's uniform-ratio
     Phase 2.
     """
+    # No weight changes here, so every layer's Hessian comes from the same
+    # dense model and they can all share calibration passes (see
+    # _compute_hessians). Full matrices are accumulated in float64, so
+    # layers are grouped to cap that at ~4GB per pass; diagonals all fit in one.
+    budget = 4 * 1024**3
+    groups: list[list[PrunableLayer]] = [[]]
+    used = 0
+    for pl in layers:
+        need = 8 * pl.module.weight.shape[1] * (1 if diag_only else pl.module.weight.shape[1])
+        if groups[-1] and used + need > budget:
+            groups.append([])
+            used = 0
+        groups[-1].append(pl)
+        used += need
+
     states: dict[str, LayerState] = {}
-    for li, pl in enumerate(layers):
-        module = pl.module
-        n_out, n_in = module.weight.shape
-        x0 = module.weight.data.clone()
-        H = _compute_hessian(model, module, calib_ids, seqlen, device, damping)
-        states[pl.name] = LayerState(
-            name=pl.name, module=module, x=x0.clone(), z=x0.clone(), u=torch.zeros_like(x0), H=H.cpu(),
-            n_in=n_in, n_out=n_out, x0_norm=x0.norm().item(), final_sparsity=0.0,
+    done = 0
+    for group in groups:
+        Hs = _compute_hessians(
+            model, [pl.module for pl in group], calib_ids, device, damping,
+            n_samples=hessian_n_calib, diag_only=diag_only,
         )
-        log_fn(f"[cold-start] layer {li+1}/{len(layers)} {pl.name}: Hessian computed, dense (no Phase 1)")
+        for pl, H in zip(group, Hs):
+            module = pl.module
+            n_out, n_in = module.weight.shape
+            x0 = module.weight.data.clone()
+            states[pl.name] = LayerState(
+                name=pl.name, module=module, x=x0.clone(), z=x0.clone(), u=torch.zeros_like(x0), H=H.cpu(),
+                n_in=n_in, n_out=n_out, x0_norm=x0.norm().item(), final_sparsity=0.0,
+            )
+        done += len(group)
+        log_fn(f"[cold-start] Hessians computed for {done}/{len(layers)} layers, dense (no Phase 1)")
     return states
 
 
@@ -515,7 +632,10 @@ def run_phase1(
         x0 = module.weight.data.clone()
         x0_norm = x0.norm().item()
 
-        H = _compute_hessian(model, module, calib_ids, cfg.seqlen, device, cfg.damping)
+        H = _compute_hessian(
+            model, module, calib_ids, cfg.seqlen, device, cfg.damping,
+            n_samples=cfg.hessian_n_calib, diag_only=cfg.diag_only_hessian,
+        )
         k_keep = _k_keep(n_in, cfg.target_sparsity)
 
         x = x0.clone()
@@ -528,7 +648,10 @@ def run_phase1(
         opt = _build_optimizer([module], cfg.lr, betas=(cfg.beta1, cfg.beta2))
 
         for r in range(cfg.rounds):
-            admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
+            if cfg.lambda_schedule == "constant":
+                admm_lambda = cfg.admm_lambda_max
+            else:
+                admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
             module.weight.data.copy_(x)
             _x_step(
                 model, teacher, [module], [(module, (z - u))],
@@ -557,7 +680,7 @@ def run_phase1(
         states[pl.name] = LayerState(
             name=pl.name, module=module, x=x, z=z, u=u, H=H.cpu(),
             n_in=n_in, n_out=n_out, x0_norm=x0_norm,
-            final_sparsity=actual_sparsity,
+            final_sparsity=actual_sparsity, admm_lambda=admm_lambda,
         )
         log_fn(
             f"[phase1] layer {li+1}/{len(layers)} {pl.name}: DONE, "
@@ -590,10 +713,16 @@ def run_phase2(
     """
     working: dict[str, LayerState] = {}
     modules = []
+    if cfg.dual_init not in ("carry", "rescale", "zero"):
+        raise ValueError(f"unknown dual_init {cfg.dual_init!r}")
     for name, s in phase1_states.items():
         x = s.x.clone()
         z = s.z.clone()
         u = s.u.clone()
+        if cfg.dual_init == "zero":
+            u.zero_()
+        elif cfg.dual_init == "rescale" and s.admm_lambda > 0:
+            u.mul_(s.admm_lambda / cfg.admm_lambda_max)
         s.module.weight.data.copy_(x)
         # Phase 1 (or build_dense_states) offloaded each H to CPU once it
         # was done with it; Phase 2 needs every layer's H simultaneously

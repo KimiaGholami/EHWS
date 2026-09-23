@@ -42,7 +42,8 @@ def diagonal_project(V: torch.Tensor, H: torch.Tensor, k_keep: int, **_ignored) 
 
     Args:
         V: (d_out, d_in) matrix to project (``v_l = x_l + u_l``).
-        H: (d_in, d_in) damped layer Hessian (only its diagonal is used).
+        H: (d_in, d_in) damped layer Hessian (only its diagonal is used), or
+            just that diagonal as a (d_in,) vector (`LayerHessian(diag_only=True)`).
         k_keep: nonzeros to keep per row (uniform across rows).
         **_ignored: absorbs extra kwargs (e.g. ``blocksize``) so this can
             be swapped in for ``obs_project`` with the same call site.
@@ -51,7 +52,7 @@ def diagonal_project(V: torch.Tensor, H: torch.Tensor, k_keep: int, **_ignored) 
         Z: (d_out, d_in), exactly k_keep nonzeros per row, each equal to
            its original ``V`` value (no correction applied to survivors).
     """
-    diag = torch.diagonal(H).clamp_min(0.0)  # (d_in,), Fhat_ii in ELSA's Eq. 11
+    diag = (H if H.dim() == 1 else torch.diagonal(H)).clamp_min(0.0)  # (d_in,), Fhat_ii in ELSA's Eq. 11
     # Score computed in float32 even when V/H are stored in bf16 (large
     # models only fit in memory at all with weights/state in bf16 -- see
     # run_pipeline.py's --dtype) -- bf16's ~7-8 mantissa bits are coarse
