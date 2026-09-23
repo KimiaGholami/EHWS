@@ -1186,3 +1186,77 @@ Launched 2026-09-11 ~15:40, all 4 GPUs, per explicit user instruction to **keep 
 **Open question sent to the user's advisor (not yet answered)**: keep developing two-phase as its own methodological contribution despite it currently being both slower and worse, or adopt one-phase as the new baseline and lean on semi-structured sparsity as the main differentiator from ELSA.
 
 **`--save-model` rerun of the one-phase config launched 2026-09-16 01:55** (`results/_1phase_savemodel/`, pid varies -- check `launch.log`), targeting a **new** HF repo `ikimyaii/HGRN-1.3-semi-structured_EHWS-1phase-80pct` (created empty just before launch). No Phase-1 checkpoint to resume from here (skip-phase1 has none), so this redoes the full ~6.8h run from scratch. **Launched with only ~7h10m walltime remaining on the current session -- user was explicitly warned this leaves almost no margin and this run has no resume checkpoint if killed, and chose to proceed anyway rather than start a fresh session.** Output on scratch from the start (lesson from Session 7 already applied). Auto-upload gate: within 20% of 57.10/41.39. Watchdog (`results/_1phase_savemodel/watchdog.sh`) escalates its walltime warning threshold more aggressively than prior watchdogs given the tight margin. **As of this write-up, just launched -- check `results/_1phase_savemodel/` and the new HF repo for the real outcome. If it dies to walltime, it must be relaunched in full, not resumed.**
+
+## Session 9 (2026-09-21/23): OPT-125M testbed -- HGRN-findings audit, a real calibration-loading bug found and fixed, step-cut sweep re-confirms one-phase beats two-phase, user chooses to keep two-phase anyway (differentiation from ELSA), over-relaxed ADMM tried and rejected with a verified (not buggy) negative result
+
+**Housekeeping first**: a model card (`README.md`) was added to the previously-cardless `ikimyaii/HGRN-1.3B-semi-structured-EHWS-80pct` HF repo (the dual-phase lambdafix-lr6e-4-beta095 checkpoint, WT2 88.23/C4 56.79, uploaded end of Session 7) -- numbers pulled directly from that exact run's `results.json` on scratch, not the near-but-not-identical exploratory-run figures quoted elsewhere in this file. One drafting error caught before it shipped: an early wording implied real ELSA's paper published an 80%-sparsity HGRN number -- it doesn't (HGRN isn't one of ELSA's own paper models, see Session 3's docstring note in `hparams.py`); corrected to say plainly that *this project* ran ELSA's official code against HGRN itself to get that comparison number, and the card was re-uploaded.
+
+### Auditing whether HGRN's Session-5-8 fixes needed porting to OPT-125M -- mostly already applied, one real documentation error found and corrected
+
+User asked to verify the HGRN lambda-fix/beta2/prox-after-clip findings against OPT-125M before running anything new on it. Checked `ehws/hparams.py` and `ehws/admm.py` directly rather than assuming:
+
+- `prox_after_clip=True` is already the global default (`ehws/admm.py`'s `Phase2Config`) -- already applies to every OPT-125M run, nothing to port.
+- The "lambda 200x too small" bug (Session 5) **never existed for OPT-125M.** `_OPT_125M`'s table already used `"constant"` schedule with ELSA's own real published per-sparsity lambda values (transcribed from ELSA's Table 5 back in Session 2, verified cell-by-cell at the time) -- the buggy cosine/5e-5 fallback only ever affected `_HGRN_1_3B`'s untabulated sparsities, which fall through to the (different, unrelated) OPT-1.3B approximation table.
+- **Real correction to this file's own Session 4 text**: line ~1108's claim that the OPT-125M `beta2=0.95` ablation (`results/opt-125m-fixablation-beta2-0.95`) ran "with the still-wrong lambda for that run" is **not supported by that run's actual saved config** -- checked `results.json` directly: `no_auto_hparams: false`, meaning auto-hparams *was* on and supplied the correct table values (`lr=6e-4, lambda=1e-3, constant`) for that run, same as its sibling `opt-125m-fixablation-prox-after-clip`. So the beta2=0.95 result (WT2 93.22/C4 54.90) is a clean, non-confounded comparison against `beta2=0.999` (WT2 85.98/C4 52.68, same other settings) -- **beta2=0.95 is a genuine loss on OPT-125M**, not an artifact of a stale lambda. This is architecture-specific and doesn't transfer from HGRN (where beta2=0.95 helped): kept the default (`0.999`) for every OPT-125M run this session rather than porting HGRN's value over.
+- `n_calib=2048` and the 3x-lr KD-dilution compensation baked into `_OPT_125M`'s table were both discovered *on* OPT-125M originally (Session 2) -- already there, nothing to port.
+
+### Real bug found and fixed: redundant, CPU-contended calibration/eval data loading across parallel sweep arms
+
+First attempt at a 4-arm parallel sweep (see below) stalled for 1h45m+ with 0% GPU utilization across all 4 processes before being killed. `py-spy dump` on the stuck PIDs confirmed all four genuinely inside `get_c4_calibration`'s reservoir-scan loop (`ehws/calibration.py:50`), not deadlocked -- just very slow. Root cause: that function's pool size is `max(2000, n_samples*20)` -- at `--n-calib 2048` that's **up to 40,960 C4 documents**, fetched from a network-streamed HF dataset and tokenized one-at-a-time, single-threaded, no batching. All 4 arms were doing this identically and redundantly (same model/seed/n_calib -> same calibration set), simultaneously contending for this node's single CPU core (`nproc`=1, same constraint documented for HGRN in Session 3).
+
+**Fix**: added `cached()` to `ehws/calibration.py` (load a tokenized tensor from disk if present, else compute once and atomically write it) and a `--calib-cache <dir>` flag to `run_pipeline.py`, opt-in and `None` by default so existing behavior/results are unaffected. Precomputed the shared calibration/eval tensors once, single process, no contention: **2330.8s (~39min)** for the `n_calib=2048` calibration set (vs. never finishing after 1h45m at 4x contention), 133.2s for the C4 eval set, 1.6s for WikiText-2 (not streamed, unaffected). All sweep arms below point `--calib-cache` at this same shared directory (`/anvil/scratch/x-kgholami/ehws-calib-cache`) and load in seconds instead of re-scanning.
+
+### Step-cut sweep: does warm-starting from Phase 1 let Phase 2 use fewer rounds without losing quality? No -- and one-phase re-confirms it beats two-phase on both axes, same as HGRN
+
+Motivation: Phase 2's round budget (128 rounds = 4096 steps) is never reduced to account for Phase 1's warm start -- it's identical to real ELSA's own full single-phase step budget, so two-phase currently does 100% of ELSA's own work in Phase 2 alone, on top of Phase 1. Tested whether a warm start lets Phase 2 converge in fewer rounds. 4 arms, `facebook/opt-125m` @ 80% sparsity, `--n-calib 2048 --calib-cache ...`, auto-hparams (`lr=6e-4, lambda=1e-3, constant`), all 4 GPUs, watchdog clean throughout (0 warnings):
+
+| Arm | Phase 1 | Phase 2 | Total wall-clock | WT2 | C4 | Zeroshot avg |
+|---|---|---|---|---|---|---|
+| Two-phase, 128 rounds (historical baseline, `opt-125m-fixablation-prox-after-clip`, no calib-cache) | ~2h34m | ~1h27m (extrapolated) | ~4h22m (extrapolated) | 85.98 | 52.68 | 0.351 |
+| **skip-phase1, 128 rounds** | -- | 5258.5s | 3h16.5m | **80.69** | **50.21** | **0.364** |
+| two-phase, 64 rounds | 9242.5s | 2576.7s | 3h33m | 98.82 | 57.85 | 0.340 |
+| two-phase, 32 rounds | 9237.2s | 1319.5s | 3h16m | 129.49 | 70.78 | 0.343 |
+| two-phase, 16 rounds | 9245.3s | 662.0s | 3h9m | 236.28 | 109.43 | 0.326 |
+
+Phase 2's cost scales cleanly linearly with round count (each halving of rounds roughly halves Phase 2's wall-clock: 2576.7 -> 1319.5 -> 662.0s), confirming no hidden per-round overhead. But **Phase 1's ~2h34m is fixed regardless of Phase 2's round count**, so cutting Phase 2 8x (128->16 rounds) only cuts total wall-clock by ~28% while quality collapses (236 vs 86 WT2) -- step-cutting Phase 2 while keeping Phase 1 is a strictly dominated lever, not a real tradeoff to exploit.
+
+**`skip-phase1` (one-phase) beats every two-phase variant on both PPL and time simultaneously** -- exactly the Session 8 HGRN finding, now replicated on a second architecture. C4 50.21 is within ~6% of real ELSA's own published OPT-125M@80% number (47.45, ELSA.pdf Table 5) -- the closest this project has gotten on OPT-125M.
+
+### User's explicit decision: keep two-phase anyway, to differentiate the method from ELSA
+
+User: "I want to keep the two phase because I want to distant my method from ELSA as much as possible." Explicitly flagged to the user before proceeding: the data above means two-phase isn't just slower than one-phase right now, it's also *worse* in PPL on both OPT-125M and HGRN -- so "distance from ELSA" via architecture alone doesn't yet come with a result that stands on its own merits, but this is a legitimate research-positioning call, not something to keep arguing against. Redirected effort toward finding a lever that makes two-phase *itself* faster or gives it a genuine algorithmic point of departure from ELSA, rather than dropping Phase 1.
+
+### Over-relaxed ADMM: implemented, tested, rejected -- a real, verified negative result
+
+New folder `relaxed_admm/` (inside `semi-structured/`, sibling to `ehws/`), keeping the parent `ehws` package's Phase 1, Z-step, and loss untouched and only forking Phase 2's update rule:
+
+- `relaxed_admm/admm_relaxed.py`: `RelaxedPhase2Config` (`Phase2Config` + `relax_alpha: float = 1.0`) and `run_phase2_relaxed`, implementing Boyd et al. 2011 (section 3.4.3) over-relaxation: `x_hat = alpha*x_new + (1-alpha)*z_prev` computed each round *before* the z/u update, with the z-step and u-step then using `x_hat` in place of the raw x-step output (`z = zstep_fn(x_hat + u, H, k_keep)`, `u = u + x_hat - z`). The x-step itself, and what seeds the *next* round's x-step, both stay unrelaxed (`s.x` = raw `x_new`), matching Boyd's formulation exactly -- `x_hat` only ever affects the z/u bookkeeping. `alpha=1.0` reduces to `x_hat == x_new`, i.e. exactly the unmodified baseline.
+- `relaxed_admm/run_pipeline.py`: copy of `../run_pipeline.py` wired to the relaxed Phase 2 (`--relax-alpha`, default 1.0), inserts `../` onto `sys.path` so `import ehws` resolves regardless of invocation cwd.
+- **Regression check** (smoke test, then a real run): `--relax-alpha 1.0` reproduced the unmodified baseline's per-round ADMM residual and final PPL bit-for-bit on a smoke test, and closely on a real run (84.79/52.55 vs. the historical 85.98/52.68 -- small gap is ordinary run-to-run noise, not the fork).
+
+**Sweep** (same testbed as the step-cut sweep, `--calib-cache` reused, watchdog clean, 0 warnings across the full ~4h run):
+
+| Arm | alpha | Rounds | WT2 | C4 | Zeroshot avg | Phase 2 time |
+|---|---|---|---|---|---|---|
+| Regression check | 1.0 | 128 | 84.79 | 52.55 | 0.360 | 5243.4s |
+| Over-relaxed | 1.5 | 128 | 105.65 | 62.06 | 0.362 | 5242.6s |
+| Over-relaxed | 1.8 | 128 | 221.46 | 105.13 | 0.357 | 5241.7s |
+| Over-relaxed, half budget | 1.5 | 64 | 133.00 | 73.02 | 0.355 | 2635.3s |
+
+**Over-relaxation hurts, monotonically, at every alpha tested -- and doesn't buy convergence speed either** (alpha=1.5 @ 64 rounds, 133.00, is worse than the *plain*-ADMM 64-round arm from the step-cut sweep, 98.82). Verified this is real, not a bug, by checking the raw per-round ADMM dual residual (`max ||u||/||x0||`) rather than trusting final PPL alone:
+
+| Round | alpha=1.0 | alpha=1.5 | alpha=1.8 |
+|---|---|---|---|
+| 1 | 2.010 | 1.855 | 1.792 |
+| 20 | 0.459 | 0.588 | 0.611 |
+| 40 | 0.423 | 0.501 | 0.699 (rose from round 20) |
+| 80 | 0.403 | 0.447 | 0.513 |
+| 128 | 0.458 | 0.470 | 0.588 |
+
+Two things this confirms: (1) `relax_alpha` is genuinely wired through and active -- the three runs diverge from each other starting at round 1 (2.010/1.855/1.792), which couldn't happen if the flag weren't affecting anything, since seed/data/hyperparameters are otherwise identical; (2) alpha=1.0 converges smoothly and monotonically while alpha=1.8 visibly oscillates (residual *rises* round 20->40 before partially recovering) -- a real instability signature, and the final residual tracks final PPL exactly (0.458/0.470/0.588 vs. 84.79/105.65/221.46). Mechanistically sound, not just correlated: Boyd's proven convergence speedup assumes a well-behaved (typically convex/continuous) proximal operator on the z-side; Phase 2's Z-step is a hard, discrete top-k projection, and extrapolating the iterate fed into it (what `x_hat` does at alpha>1) can flip which specific weights survive from round to round -- a much rougher operator to relax against than what the technique was designed for.
+
+**Decision: over-relaxed ADMM is closed out, not worth retrying at smaller alpha** -- the degradation is monotonic starting from alpha=1.0 itself (1.0 is already the best of the four), so there's no reason to expect an untested value between 1.0 and 1.5 to reverse the trend.
+
+### Not yet tried: adaptive/residual-balancing penalty (proposed, not yet run)
+
+Floated as the next candidate for a genuine two-phase-preserving, ELSA-differentiating, Phase-2-only mathematical change: classic ADMM residual-balancing adjusts the penalty parameter (`admm_lambda`, this project's rho) each round based on the primal/dual residual ratio, instead of the current fixed schedule (constant or cosine-ramped). Doesn't touch the Z-step's hard projection the way over-relaxation did, so it may not hit the same failure mode. Not implemented or tested yet -- next natural candidate if this direction is pursued further.

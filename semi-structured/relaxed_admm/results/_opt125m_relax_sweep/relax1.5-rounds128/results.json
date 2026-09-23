@@ -1,0 +1,301 @@
+{
+  "model": "facebook/opt-125m",
+  "config": {
+    "model": "facebook/opt-125m",
+    "sparsities": [
+      0.8
+    ],
+    "zeroshot_sparsities": [
+      0.8
+    ],
+    "n_calib": 2048,
+    "seqlen": 2048,
+    "n_eval_c4": 256,
+    "seed": 0,
+    "calib_cache": "/anvil/scratch/x-kgholami/ehws-calib-cache",
+    "device": "cuda",
+    "dtype": "float32",
+    "out": "/anvil/scratch/x-kgholami/ehws-opt125m-relax-sweep/relax1.5-rounds128",
+    "checkpoint_dir": null,
+    "p1_target_sparsity": 0.7,
+    "p1_rounds": 14,
+    "p1_x_steps": 4,
+    "p1_lr": 0.0002,
+    "p1_lambda": 5e-05,
+    "p1_max_grad_norm": 1.0,
+    "p2_rounds": 128,
+    "p2_x_steps": 32,
+    "p2_lr": 0.0001,
+    "p2_lambda_max": 5e-05,
+    "p2_lambda_schedule": "cosine",
+    "p2_max_grad_norm": 1.0,
+    "relax_alpha": 1.5,
+    "micro_batch": 2,
+    "grad_accum": 4,
+    "p2_micro_batch": null,
+    "p2_grad_accum": null,
+    "alpha_kd": 0.5,
+    "kd_temperature": 1.0,
+    "damping": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "prox_after_clip": true,
+    "no_auto_hparams": false,
+    "skip_zeroshot": false,
+    "skip_phase1": false,
+    "gradient_checkpointing": false,
+    "smoke_test": false,
+    "save_model": false,
+    "zstep": "diagonal"
+  },
+  "dense": {
+    "wikitext2_ppl": 27.6556396484375,
+    "c4_ppl": 25.170392990112305,
+    "zeroshot": {
+      "arc_challenge": 0.18686006825938567,
+      "arc_easy": 0.4297138047138047,
+      "boolq": 0.5620795107033639,
+      "hellaswag": 0.2923720374427405,
+      "openbookqa": 0.166,
+      "rte": 0.49097472924187724,
+      "winogrande": 0.5138121546961326,
+      "average": 0.3774017578653292
+    }
+  },
+  "sparsity": {
+    "0.8": {
+      "target_sparsity": 0.8,
+      "achieved_sparsity": 0.7996961871782938,
+      "wikitext2_ppl": 105.65107727050781,
+      "c4_ppl": 62.055660247802734,
+      "zeroshot": {
+        "arc_challenge": 0.18430034129692832,
+        "arc_easy": 0.3484848484848485,
+        "boolq": 0.6217125382262997,
+        "hellaswag": 0.26309500099581756,
+        "openbookqa": 0.116,
+        "rte": 0.5126353790613718,
+        "winogrande": 0.48855564325177586,
+        "average": 0.3621119644738631
+      }
+    }
+  },
+  "phase1_summary": {
+    "blocks.0.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.0.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.0.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.0.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.0.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.0.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.1.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.1.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.1.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.1.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.1.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.1.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.2.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.2.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.2.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.2.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.2.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.2.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.3.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.3.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.3.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.3.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.3.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.3.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.4.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.4.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.4.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.4.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.4.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.4.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.5.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.5.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.5.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.5.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.5.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.5.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.6.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.6.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.6.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.6.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.6.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.6.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.7.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.7.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.7.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.7.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.7.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.7.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.8.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.8.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.8.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.8.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.8.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.8.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.9.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.9.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.9.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.9.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.9.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.9.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.10.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.10.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.10.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.10.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.10.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.10.fc2": {
+      "final_sparsity": 0.6998698115348816
+    },
+    "blocks.11.self_attn.q_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.11.self_attn.k_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.11.self_attn.v_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.11.self_attn.out_proj": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.11.fc1": {
+      "final_sparsity": 0.7005208134651184
+    },
+    "blocks.11.fc2": {
+      "final_sparsity": 0.6998698115348816
+    }
+  }
+}

@@ -16,6 +16,7 @@ Section B.1 evaluation protocol ("Perplexity is measured on the held-out
 
 from __future__ import annotations
 
+import os
 import random
 
 import torch
@@ -101,3 +102,27 @@ def get_c4_eval(
         start = rng.randint(0, ids.shape[0] - seqlen - 1)
         samples.append(ids[start : start + seqlen])
     return torch.stack(samples, dim=0)
+
+
+def cached(cache_path: str | None, compute_fn):
+    """Load a tokenized dataset tensor from ``cache_path`` if present,
+    otherwise compute it with ``compute_fn`` and save it there.
+
+    The calibration/eval builders above scan thousands of streamed C4
+    documents one at a time (no batching) to fill their reservoir pool --
+    cheap for one process, but multiple runs against the *same*
+    model/n_samples/seqlen/seed (e.g. parallel arms of a sweep) redo that
+    identical scan redundantly, competing for CPU. ``cache_path=None``
+    (the default everywhere) preserves the original always-recompute
+    behavior exactly.
+    """
+    if cache_path is None:
+        return compute_fn()
+    if os.path.exists(cache_path):
+        return torch.load(cache_path)
+    tensor = compute_fn()
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    tmp_path = cache_path + ".tmp"
+    torch.save(tensor, tmp_path)
+    os.replace(tmp_path, cache_path)  # atomic -- no partial-file reads by a concurrent arm
+    return tensor

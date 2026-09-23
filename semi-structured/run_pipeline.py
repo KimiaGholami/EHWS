@@ -26,7 +26,7 @@ from ehws.admm import (
     Phase1Config, Phase2Config, build_dense_states, load_phase1_checkpoint,
     run_phase1, run_phase2, save_phase1_checkpoint,
 )
-from ehws.calibration import get_c4_calibration, get_c4_eval, get_wikitext2_test
+from ehws.calibration import cached, get_c4_calibration, get_c4_eval, get_wikitext2_test
 from ehws.diagonal_projection import diagonal_project, magnitude_project
 from ehws.hparams import get_phase2_hparams
 from ehws.model_layers import discover_prunable_layers, disable_fused_kernels
@@ -53,6 +53,13 @@ def parse_args():
     p.add_argument("--seqlen", type=int, default=2048)
     p.add_argument("--n-eval-c4", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--calib-cache", default=None,
+        help="directory to cache the tokenized calibration/eval tensors in, keyed by "
+             "model/n-calib/n-eval-c4/seqlen/seed. Building these scans thousands of streamed C4 "
+             "docs single-threaded with no batching -- worth sharing across parallel runs of the "
+             "same config (e.g. sweep arms) instead of redoing it once per process. Off by default.",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument(
         "--dtype", choices=["float32", "bfloat16"], default="float32",
@@ -231,12 +238,32 @@ def main():
         p.requires_grad_(False)
     teacher.eval()
 
+    model_tag = args.model.replace("/", "_")
+
+    def _cache_file(name: str) -> str | None:
+        if args.calib_cache is None:
+            return None
+        return os.path.join(
+            args.calib_cache,
+            f"{model_tag}_{name}_n{args.n_calib if name == 'calib' else args.n_eval_c4}"
+            f"_seq{args.seqlen}_seed{args.seed if name == 'calib' else args.seed + 1}.pt",
+        )
+
     print(f"Loading calibration data: C4, n={args.n_calib}, seqlen={args.seqlen}")
-    calib_ids = get_c4_calibration(tokenizer, n_samples=args.n_calib, seqlen=args.seqlen, seed=args.seed)
+    calib_ids = cached(
+        _cache_file("calib"),
+        lambda: get_c4_calibration(tokenizer, n_samples=args.n_calib, seqlen=args.seqlen, seed=args.seed),
+    )
 
     print("Loading perplexity eval sets: WikiText-2 test, C4 validation")
-    wt2_ids = get_wikitext2_test(tokenizer, seqlen=args.seqlen)
-    c4_eval_ids = get_c4_eval(tokenizer, n_samples=args.n_eval_c4, seqlen=args.seqlen, seed=args.seed + 1)
+    wt2_ids = cached(
+        os.path.join(args.calib_cache, f"{model_tag}_wt2_seq{args.seqlen}.pt") if args.calib_cache else None,
+        lambda: get_wikitext2_test(tokenizer, seqlen=args.seqlen),
+    )
+    c4_eval_ids = cached(
+        _cache_file("c4eval"),
+        lambda: get_c4_eval(tokenizer, n_samples=args.n_eval_c4, seqlen=args.seqlen, seed=args.seed + 1),
+    )
 
     results = {"model": args.model, "config": vars(args), "dense": {}, "sparsity": {}}
 
