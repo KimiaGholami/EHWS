@@ -114,10 +114,11 @@ def parse_args():
     )
     p.add_argument("--p2-max-grad-norm", type=float, default=1.0)
     p.add_argument(
-        "--p2-dual-init", choices=["carry", "rescale", "zero"], default="carry",
+        "--p2-dual-init", choices=["carry", "rescale", "zero"], default="rescale",
         help="how Phase 1's scaled dual u enters Phase 2 (see ehws/admm.py's Phase2Config.dual_init). "
-             "'carry' (default, original behavior) hands u over as-is, so the real dual lambda*u jumps "
-             "by lambda_p2/lambda_p1 at the handoff; 'rescale' keeps lambda*u unchanged; 'zero' resets "
+             "'rescale' (default since Session 10) keeps the real dual lambda*u unchanged across the "
+             "handoff; 'carry' (original behavior) hands u over as-is, so lambda*u jumps by "
+             "lambda_p2/lambda_p1; 'zero' resets "
              "u. No effect with --skip-phase1 (u starts at 0 there). Phase-2-only, so a saved Phase 1 "
              "checkpoint can be reused across all three.",
     )

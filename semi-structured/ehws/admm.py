@@ -276,9 +276,11 @@ class Phase2Config:
     #                default) is far below Phase 2's, so the real dual
     #                (lambda * u) jumps by lambda_p2/lambda_p1 at the handoff.
     #   "rescale" -- u *= lambda_p1 / admm_lambda_max, keeping the real dual
-    #                unchanged across the handoff.
+    #                unchanged across the handoff. Made default 2026-09-26 --
+    #                beat carry and zero on both WT2/C4 in the Session 10
+    #                OPT-125M sweep, see PROGRESS.md
     #   "zero"    -- u = 0; Phase 2 keeps Phase 1's x and z but starts a fresh dual.
-    dual_init: str = "carry"
+    dual_init: str = "rescale"
     alpha_kd: float = 0.5
     kd_temperature: float = 1.0  # 1.0 = untempered KD (original behavior); see losses.py's combined_loss
     seqlen: int = 2048

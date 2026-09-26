@@ -1351,3 +1351,40 @@ Also check that Phase 2's round-1 `max ||u||/||x0||` in `run.log` has dropped fr
 Record every result back in this file.
 
 **Why not run this on a laptop:** timed on an M1 Pro (2026-09-23), one OPT-125M Phase 2 step at seqlen 2048 / batch 8 takes 27s on CPU and 212s on MPS (likely memory pressure from full-vocab logits in 16GB), vs ~1.3s on an A100. That's ~31h for Phase 2 alone on CPU, 2-3 days per arm with Phase 1. It needs the GPUs.
+
+## Session 11 (2026-09-24 to 2026-09-26): Session 10 runbook results -- `rescale` handoff wins, made default
+
+Ran the Session 10 runbook as written: OPT-125M @80%, n_calib=2048, calibration cache, `--hessian-n-calib 256` on all four arms, one arm per A100, all four in parallel. All finished cleanly (no crashes, all `results.json` written). Auto-hparams supplied Phase 2's lr=6e-4, lambda=1e-3, constant, as in Session 9.
+
+### Results (WT2 / C4 PPL, lower is better; zero-shot = 7-task average accuracy)
+
+| Arm | Handoff | WT2 | C4 | Zero-shot avg | Avg w/o BoolQ | Phase 2 round-1 `max \|\|u\|\|/\|\|x0\|\|` |
+|---|---|---|---|---|---|---|
+| `s10-hess256` (arm 0) | carry | 87.04 | 53.77 | 0.369 | 0.327 | 1.87 |
+| `s10-dualzero` | zero | 84.11 | 52.63 | 0.375 | 0.334 | 0.66 |
+| `s10-p1lam-const` | P1 lambda=1e-3 constant + rescale | 82.03 | 51.80 | 0.366 | 0.323 | 1.68 |
+| **`s10-dualrescale`** | **rescale** | **80.89** | **51.55** | 0.340 | 0.325 | 0.69 |
+| Session 9 two-phase (full H) | carry | 84.79 | 52.55 | | | ~2.0 |
+| Session 9 one-phase | -- | 80.69 | 50.21 | | | |
+
+Timing (all four arms nearly identical): Phase 1 **~4207s** (Session 9: ~9240s), Phase 2 ~5271s (Session 9: ~5240s). All arms reached achieved_sparsity 0.7997.
+
+### What it means
+
+- **Hessian subsampling (arm 0 vs Session 9 two-phase):** Phase 1 is 2.2x faster, for +2.7% WT2 / +2.3% C4. That's right at the runbook's "within ~2-3%" line: keep `--hessian-n-calib 256` for iteration, but use the full H for headline numbers (or try 512).
+- **The handoff hypothesis is confirmed.** All three fixes beat arm 0, and `rescale` is best on both WT2 (-7.1%) and C4 (-4.1%). `zero` helps less (-3.4% / -2.1%), so Phase 1's dual carries useful direction and was only the wrong size. `p1lam-const` (same penalty in both phases, so `rescale` is a no-op) lands close to `rescale`, which confirms the same diagnosis from another angle.
+- **Dual size converges anyway:** by Phase 2 round 32 every arm (including carry) sits at `max ||u||/||x0||` ~0.45-0.48, ~0.40-0.43 at round 64/96. The oversized dual does its damage in the first rounds, and the model doesn't fully recover from it.
+- **Versus one-phase:** `dualrescale` ties it on WT2 (80.89 vs 80.69) but is 2.7% worse on C4 (51.55 vs 50.21). Not a clear win yet, and one-phase used the full H, so that comparison isn't like-for-like.
+- **Zero-shot doesn't separate the arms.** `dualrescale`'s lower average comes entirely from BoolQ (0.43 vs ~0.62 in the others). Without BoolQ all four are within ~1 point (0.323-0.334), which is noise for a 125M model near chance. Use PPL to decide at this scale.
+- Single seed per arm. The `rescale` vs `p1lam-const` gap (~1.4% WT2 / 0.5% C4) is small enough that a second seed is worth running before drawing conclusions about Phase 1's lambda.
+
+### Code change: `--p2-dual-init rescale` made the default
+
+`Phase2Config.dual_init` and `run_pipeline.py`'s `--p2-dual-init` now default to `rescale` (was `carry`); pass `--p2-dual-init carry` to reproduce older runs. Phase 1's lambda/schedule defaults are **unchanged** (5e-5, cosine). `rescale` scored better than matching lambdas, it's correct under any pair of penalties (a no-op when they're equal), and a matched Phase 1 lambda would need per-model tuning (e.g. 1e-2 for HGRN, untested in Phase 1).
+
+### Next (fresh OnDemand session needed; this one had <3h walltime left when the sweep finished)
+
+1. **Step-cut test** (runbook step 4): `dualrescale` config with `--p2-rounds 64` and `--p2-rounds 32`. Session 9's collapse (98.82 / 129.49 WT2) was measured with the carry bug, so it needs remeasuring. If quality stays near 81, two-phase can run in less time than ELSA.
+2. **Like-for-like one-phase comparison:** `dualrescale` without `--hessian-n-calib` (full H), to see whether it beats one-phase's 80.69 / 50.21.
+3. Optional: second seed of `dualrescale` and `p1lam-const`.
+4. Then port the winner to HGRN-1.3B (runbook step 6).
