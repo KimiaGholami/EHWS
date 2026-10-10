@@ -1,0 +1,30 @@
+#!/bin/bash
+# Batch job body. Don't sbatch this directly -- submit.sh supplies the
+# account, time, GPU count, and log path on the sbatch command line.
+#
+# Args: <project subdir> <run_pipeline.py args...>
+#SBATCH -p gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mail-type=FAIL
+
+set -euo pipefail
+
+PROJECT="$1"; shift
+
+module load modtree/gpu
+
+export SCRATCH="${SCRATCH:-/anvil/scratch/$USER}"
+export HF_HOME="$SCRATCH/hf-cache"   # keep model/dataset downloads off the 25GB /home quota
+export PYTHONUNBUFFERED=1
+
+cd "$EHWS_REMOTE_DIR/$PROJECT"
+
+echo "job $SLURM_JOB_ID on $(hostname), started $(date)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+echo "cmd: python run_pipeline.py $*"
+
+"$EHWS_VENV/bin/python3" run_pipeline.py "$@"
+
+echo "finished $(date)"

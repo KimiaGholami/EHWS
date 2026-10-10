@@ -1,0 +1,8 @@
+2026-10-07 20:05:54 waiting for job 21177562 to start
+2026-10-08 22:19:13 job 21177562 RUNNING on g003; starting launch.sh there in 2 min
+2026-10-08 22:21:14 launch.sh started on g003
+2026-10-08 22:21:14 stage 1: GPU smoke test on g003 GPU 0
+2026-10-08 22:34:57 smoke exit=0 peak_gpu_mem=9465MiB
+2026-10-08 22:34:57 stage 2: full run local-fp32-elsadata-extra-hrefresh on GPU 0
+2026-10-09 02:16:04 FULL RUN DONE: WT2 46.49 / C4 34.58 (ELSA protocol)
+2026-10-09 02:16:29 watchdog: run process gone, stopping

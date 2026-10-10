@@ -76,6 +76,28 @@ def get_wikitext2_test(tokenizer: PreTrainedTokenizerBase, seqlen: int = 2048) -
     return ids.view(n_chunks, seqlen)
 
 
+def get_c4_eval_elsa(tokenizer: PreTrainedTokenizerBase, seqlen: int = 2048) -> torch.Tensor:
+    """ELSA-official's C4 test set (`lib/data.py::get_loaders`, the Wanda/SparseGPT protocol).
+
+    The first 1,100 documents of the `c4-validation.00000-of-00008` shard,
+    space-joined, tokenized as one string, truncated to 256 * seqlen tokens
+    and cut into seqlen chunks. Deterministic (no sampling), unlike
+    `get_c4_eval`. ELSA tokenizes with ``use_fast=False``; pass a slow
+    tokenizer to match it exactly.
+    """
+    data = load_dataset(
+        "allenai/c4", data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"}, split="validation",
+    )
+    ids = tokenizer(" ".join(data[:1100]["text"]), return_tensors="pt").input_ids[:, : 256 * seqlen]
+    n_chunks = ids.shape[1] // seqlen
+    return ids[0, : n_chunks * seqlen].view(n_chunks, seqlen)
+
+
+def get_wikitext2_test_elsa(tokenizer: PreTrainedTokenizerBase, seqlen: int = 2048) -> torch.Tensor:
+    """WikiText-2 test exactly as ELSA builds it: same text as `get_wikitext2_test`; pass a slow tokenizer."""
+    return get_wikitext2_test(tokenizer, seqlen=seqlen)
+
+
 def get_c4_eval(
     tokenizer: PreTrainedTokenizerBase,
     n_samples: int = 256,
@@ -126,3 +148,19 @@ def cached(cache_path: str | None, compute_fn):
     torch.save(tensor, tmp_path)
     os.replace(tmp_path, cache_path)  # atomic -- no partial-file reads by a concurrent arm
     return tensor
+
+
+def get_elsa_train_cache(path: str) -> torch.Tensor:
+    """ELSA-official's own tokenized training set, as an (n, seqlen) tensor.
+
+    `path` is the directory ELSA's `lib/data.py::get_dataset` writes with
+    `--admm_save_inputs=True` (`save_to_disk` format), e.g.
+    `ELSA-official/dataset/fla-hub_hgrn-1.3B-100B/train/c4_32768_2048_hub`:
+    32,768 random 2048-token crops of C4 train shard 00000, slow tokenizer,
+    seed 0. Training on it gives Phase 2 exactly ELSA's tokens.
+    """
+    from datasets import load_from_disk
+
+    col = load_from_disk(path).data.column("input_ids").combine_chunks()
+    flat = torch.from_numpy(col.flatten().to_numpy().astype("int64"))
+    return flat.view(len(col), -1)

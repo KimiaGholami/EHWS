@@ -1388,3 +1388,383 @@ Timing (all four arms nearly identical): Phase 1 **~4207s** (Session 9: ~9240s),
 2. **Like-for-like one-phase comparison:** `dualrescale` without `--hessian-n-calib` (full H), to see whether it beats one-phase's 80.69 / 50.21.
 3. Optional: second seed of `dualrescale` and `p1lam-const`.
 4. Then port the winner to HGRN-1.3B (runbook step 6).
+
+## Session 12 (2026-09-29): why two-phase is slower than one-phase, and a local (reconstruction) Phase 1
+
+### Why two-phase was slower -- structural, not a tuning issue
+
+- **Phase 2 never gets shorter.** It always runs 128 rounds x 32 steps = 4096 steps, ELSA's whole budget. Phase 1 is pure extra work on top.
+- **Phase 1 wasn't really layer-wise.** Every Phase 1 x-step trains one layer against the *full-model* CE+KD loss: a full student forward/backward plus a teacher forward. At 14 rounds x 4 steps = 56 per layer, that's 72 x 56 = 4032 full-model steps on OPT-125M (about one more Phase 2) and 168 x 56 = 9408 on HGRN-1.3B (about 2.3 Phase 2s), plus one Hessian pass per layer.
+- **Phase 1's 70% target** was copied from EHWS-U's sweep (Phase 1 in {0.3, 0.5, 0.7, 0.9} against a Phase 2 target of **0.5**), never re-swept for 0.8. Its stated reason (run Phase 1 once, reuse it for every Phase 2 sparsity) never applied: every run here is 80% only.
+- **Phase 2 didn't start from the pruned model.** It loads Phase 1's `x`, which is still dense (at the default lambda 5e-5 it barely moves toward `z`), plus the 70% `z` and the dual. Each layer's `x` was also trained with earlier layers pruned and later ones dense, but Phase 2 starts with all of them dense.
+- **Phase 1's lr (`--p1-lr 2e-4`)** is fixed and untuned. Auto-hparams sets only Phase 2 (6e-4, including the 3x KD boost). Moot for local mode below, which has no lr.
+
+### New: `--p1-mode local` (`ehws/admm.py::run_phase1_local`)
+
+Each layer solves its own reconstruction problem, `min_W 1/2 tr((W - W0) H (W - W0)^T)` = `||(W - W0) X||^2 / N`, under the same semi-structured per-row top-k constraint, using the H already measured for the Z-step. There's no backprop and no teacher; the only model passes are the Hessian measurements.
+
+- **ADMM with a closed-form x-step:** `x = (W0 H + rho (z - u)) (H + rho I)^-1`, done with one `eigh(H)` per layer. `rho` grows geometrically from `0.01` to `10` x mean(diag H) over 50 rounds (ALPS recipe), and the scaled dual is rescaled whenever `rho` changes. The Z-step is the same `--zstep` function as everywhere else.
+- **Refit:** exact per-row least squares of the kept weights on the final support, `H_SS w_S = (W0 H)_S`, batched, since every row keeps exactly k. Turn it off with `--no-p1-local-refit`.
+- **Shared-input groups:** layers that read the same input tensor (q/k/v) share one Hessian pass (detected by input `data_ptr` on one short forward). This is exact, because pruning one can't change the others' inputs. OPT-125M: 72 layers in 48 groups.
+- **Target:** `--p1-target-sparsity` now defaults to the lowest `--sparsities` value in local mode (0.8 here). Global mode keeps 0.7.
+- **Handoff:** `x = z` (the pruned weights), `u = 0`, `admm_lambda = 0`. Phase 2 starts from the actually-pruned model with a fresh dual. The local dual belongs to a different objective and scale, so there's nothing to carry.
+- **Flags:** `--p1-mode {global,local}` (default `global`, so all old configs reproduce unchanged), `--p1-local-rounds`, `--p1-local-rho-start`, `--p1-local-rho-end`, `--no-p1-local-refit`. The local config goes into the checkpoint meta. Global-mode meta is unchanged, so existing checkpoints still load.
+- **`_compute_hessians`** takes an optional `dtype`. Local mode measures H in float32, because bf16 (HGRN) is too coarse for eigh/Cholesky.
+
+**Verified:**
+- On a synthetic layer (GPU), ADMM cut reconstruction error 0.355 -> 0.167 against one-shot projection, and every row keeps exactly k.
+- The batched refit matches a brute-force per-row solve to 1.7e-6.
+
+### First real run: local Phase 1 only (`results/opt-125m-s12-local-p1only`, `--skip-phase2`)
+
+OPT-125M @80%, n_calib 2048, `--hessian-n-calib 256`, calibration cache:
+- **Phase 1: 171s**, against ~4207s for global Phase 1 at the same Hessian setting (Session 11) and ~9240s with the full H (Session 9). About **25x faster**.
+- Per-layer relative reconstruction error, averaged over 72 layers: 0.119 one-shot -> 0.041 after ADMM + refit.
+- Phase 1 output alone: WT2 681.2 / C4 338.4. As expected, one-shot 80% on a 125M model is poor; what matters is how fast Phase 2 converges from it.
+
+### Running: step-cut sweep from the local warm start (launched 2026-09-29, all at `--hessian-n-calib 256`)
+
+| GPU | Run | Question |
+|---|---|---|
+| 0 | `opt-125m-s12-local-r128` | Local warm start + full Phase 2: vs one-phase 80.69/50.21 and `dualrescale` 80.89/51.55 |
+| 1 | `opt-125m-s12-local-r64` | Can Phase 2 be halved? |
+| 2 | `opt-125m-s12-local-r32` | Quartered? |
+| 3 | `opt-125m-s12-1phase-r64` | Control: one-phase at 64 rounds, so a good local-r64 isn't just "64 rounds is enough" |
+
+All four arms finished cleanly (2026-09-29 ~20:00-21:45, 4 GPUs in parallel). The watchdog (`results/_s12_sweep/watchdog.sh`) raised no alerts. GPU memory peaked at ~16 of 40 GB.
+
+| Run | Phase 1 | Phase 2 | WT2 | C4 | Zero-shot avg | Avg w/o BoolQ |
+|---|---|---|---|---|---|---|
+| `local-r32` | 203s | 1324s | 104.35 | 63.95 | 0.356 | 0.325 |
+| `local-r64` | 204s | 2625s | 86.37 | 56.26 | 0.360 | 0.317 |
+| `1phase-r64` (control) | -- | 2631s | 91.32 | 54.01 | 0.354 | 0.319 |
+| `local-r128` | 204s | 5118s | 83.35 | 52.70 | 0.371 | 0.330 |
+| *Session 9 one-phase, 128 rounds (full H)* | -- | 5259s | *80.69* | *50.21* | *0.364* | |
+| *Session 11 `dualrescale`, 128 rounds (H 256)* | 4207s | 5271s | *80.89* | *51.55* | *0.340* | *0.325* |
+| *Session 9 two-phase, 32 rounds (carry, full H)* | 9237s | 1320s | *129.49* | *70.78* | | |
+
+### What it means
+
+- **Speed: solved.** Local Phase 1 takes ~3.4 min against ~70 min (global, H 256) or ~154 min (global, full H). Two-phase now costs about the same wall-clock as one-phase.
+- **Quality: local Phase 1 doesn't help, and at full length it hurts.**
+  - `local-r128` (83.35 / 52.70) is worse than one-phase (80.69 / 50.21, +3.3% / +5.0%) and than `dualrescale` (80.89 / 51.55).
+  - Caveat: the one-phase reference used the full H and these arms used H 256. Session 11 measured that setting at about +2.5%, so the local arm is at best roughly tied with one-phase, not better.
+- **Step-cut: mixed, not a win.** At 64 rounds, local beats one-phase on WT2 (86.37 vs 91.32) but loses on C4 (56.26 vs 54.01). Single seed. At 32 rounds, local (104.35 / 63.95) beats Session 9's old two-phase (129.49 / 70.78), but that comparison has the old carry-bug handoff and no one-phase 32-round control.
+- **Zero-shot:** all arms are within ~1.5 points without BoolQ. That doesn't separate them at 125M (same as Session 11).
+- **Likely reason (hypothesis, untested):** Phase 2 here starts from the *pruned* weights (`x = z`, `u = 0`). One-phase starts from the *dense* weights, and ADMM moves them gradually toward the constraint while the task loss is still informed by the full model. Starting pruned throws away the pruned weights' information before Phase 2's CE+KD can use it. Every good result so far (one-phase; `dualrescale`, whose `x` is near-dense) started Phase 2 from dense or near-dense `x`.
+
+### Next
+
+1. **Dense-start handoff:** keep local Phase 1's mask/weights as Phase 2's initial `z`, but start `x` from the dense weights (`x = W0`, `u = 0`). Phase 2's first prox target is then the good local `z` instead of a one-shot projection, and nothing is thrown away. It's a small code change (a `--p1-local-handoff {pruned,dense}` flag) and the most direct test of the hypothesis above.
+2. **Like-for-like control:** one-phase at 128 rounds with `--hessian-n-calib 256`, so the 128-round comparison no longer mixes Hessian settings.
+3. If (1) beats one-phase at 128 rounds, repeat the step-cut (64 / 32) with it, then port to HGRN-1.3B.
+
+## Session 13 (2026-09-30): ELSA under the same semi-structured constraint (fair baseline)
+
+**Why:** every ELSA comparison so far set our semi-structured (same nonzeros per row) result against ELSA's *unstructured* number, which is a looser constraint. A paper needs ELSA under the same constraint.
+
+**ELSA's real OPT-125M @80% numbers** (`ELSA.pdf` appendix table, unstructured): **WT2 65.30 / C4 47.74** (dense 27.65 / 26.56). Correction to Session 2: the WT2 value *is* in the paper. The 47.45 quoted there is from the main text and differs slightly from the table. The same table has ALPS at 484.8 / 267.7 and SparseGPT at 2072 / 1050.
+
+**Patch to `ELSA-official`** (local, uncommitted there): new flag `--admm_comparison_group {layer,row}`, default `layer` (ELSA's unchanged behaviour). ELSA's projection already had a `"row"` mode (`lib/utils.py::_proj_impl_dense`, keep the top-k per row, the same rule as our `diagonal_projection`), but all five call sites hard-coded `"layer"`. The flag goes through `main.py` -> `lib/prune.py` -> `lib/trainer.py` -> `lib/optimizers.py`: initial z, per-interval z-step, final projection, and the trainer's residual logging.
+- **Verified** (4-step smoke run, saved weights): all 72 linears have identical nonzeros in every row. The keep count is 154/768 per row, the same as ours. fc2 keeps 615/3072 vs our 614 (ELSA uses `int()`, we use `round()`; a 0.03% difference).
+- ELSA's importance score is unchanged (default `identity` = |w|). We use diag(H)·v². That's part of ELSA's method, so it stays as-is.
+
+**Eval comparability:** ELSA's own C4 eval uses a different C4 validation sample than ours, so its C4 PPL is **not** comparable to our `results.json`. WT2 (the full test set) is comparable. New `eval_external.py` scores any saved state dict with our exact pipeline (the same cached WT2/C4 token sets, perplexity code and zero-shot harness), and checks sparsity and row uniformity. Verified on the dense model: reproduces our baseline exactly (27.656 / 25.170).
+
+**Running:** `ELSA-official/results/opt-125m-0.8-row/` (`launch.sh`; model saved to `/anvil/scratch/x-kgholami/elsa-out/opt-125m-0.8-row/`). ELSA Table 4/5 settings for OPT-125M @80%: lr 2e-4, lambda 1e-3 constant, 4096 steps, interval 32, batch 1x8, bf16, 32,768 C4 sequences, seed 0. The watchdog is `watchdog.sh` in the same folder. When it finishes, score it with:
+```
+CUDA_VISIBLE_DEVICES=0 $PY eval_external.py --model facebook/opt-125m \
+  --weights /anvil/scratch/x-kgholami/elsa-out/opt-125m-0.8-row/*/model.safetensors --out results/elsa-opt-125m-0.8-row-ourseval
+```
+Compare against our OPT-125M @80% results: one-phase 80.69 / 50.21, `dualrescale` two-phase 80.89 / 51.55, local two-phase 83.35 / 52.70.
+
+### ELSA-protocol perplexity for every model (Session 13, continued)
+
+**Why:** C4 perplexities from our code and ELSA's are measured on different C4 text, so they can't be compared (see above). ELSA's protocol (`ELSA-official/lib/{data,eval}.py`, inherited from Wanda/SparseGPT) differs from ours in four ways:
+
+| | Ours (`c4_ppl`, `wikitext2_ppl`) | ELSA (`*_ppl_elsa`) |
+|---|---|---|
+| C4 test set | ~256 random C4 validation docs, seed 1 | First 1,100 docs of `c4-validation.00000-of-00008`, space-joined, first 256 x 2048 tokens (deterministic) |
+| PPL formula | NLL / (n x 2047 predicted tokens) | NLL / (n x 2048) |
+| Tokenizer | fast | slow (`use_fast=False`) |
+| Eval dtype | the run's dtype (fp32 OPT, bf16 HGRN) | float16 |
+
+**Implemented:** `ehws/calibration.py::get_c4_eval_elsa` / `get_wikitext2_test_elsa` and `ehws/perplexity.py::compute_perplexity_elsa`.
+- `run_pipeline.py` now reports `wikitext2_ppl_elsa` / `c4_ppl_elsa` for the dense baseline and every pruned result. It's on by default (`--no-elsa-eval` turns it off), uses a float16 *copy* so the saved weights are untouched, and caches the token sets as `<model>_{wt2,c4}_elsa_seq2048.pt` in `--calib-cache`.
+- `eval_external.py` reports the same for any saved state dict (`--weights dense` = unpruned base; `--weights-only-elsa` skips our protocol).
+
+**Verified exact:** dense OPT-125M under our ELSA-protocol code = **27.611 / 26.521**. ELSA-official's own `main.py --sparsity_ratio=0` on the same model = **27.6111 / 26.5214**. ELSA's paper prints 27.65 / 26.56 for dense OPT-125M, about 0.15% off its own released code, so comparisons should use the code's numbers.
+
+**Which pruned models exist:** only two HGRN checkpoints were ever saved (two-phase lambdafix, uploaded to HF; one-phase lambdafix). No OPT-125M run saved weights, and ELSA's own HGRN run didn't either (its 54.08 / 36.92 is already under ELSA's protocol, since ELSA's code printed it).
+
+**Running (2026-09-30 ~21:00):**
+- `results/_elsa_protocol_eval/hgrn.sh` (GPU 1): ELSA-protocol PPL for dense HGRN and both saved HGRN models.
+- `results/_elsa_protocol_eval/reruns.sh` (GPUs 1-3): reruns six OPT-125M configs with `--save-model`, settings copied from each original `results.json`:
+  - one-phase r128 (full H) and r64
+  - two-phase `dualrescale` r128
+  - local r128 / r64 / r32
+  
+  Output goes to `/anvil/scratch/x-kgholami/ehws-exp-out/elsa-protocol-reruns/`. Each rerun also checks reproducibility against the original number.
+- Superseded ablations (relaxed ADMM, Session 2-4 runs) were not rerun.
+- The watchdog is `results/_elsa_protocol_eval/watchdog.sh`.
+
+### Results so far (2026-09-30 21:03; update as runs land)
+
+ELSA protocol = ELSA-official's own eval (its C4 set, formula, slow tokenizer, fp16). "Ours" = our `results.json` protocol.
+
+| Model @ 80% | Sparsity type | WT2 (ELSA) | C4 (ELSA) | WT2 (ours) | C4 (ours) |
+|---|---|---|---|---|---|
+| HGRN-1.3B dense | -- | 11.81 | 16.10 | | |
+| HGRN two-phase lambdafix (HF checkpoint, `ehws-savemodel-out/...`) | semi (rows verified uniform), 0.7999 | **87.73** | **55.46** | 88.23 | 56.79 |
+| HGRN one-phase lambdafix (`ehws-exp-out/...skipphase1...savemodel`) | semi (rows verified uniform), 0.7999 | **56.57** | **40.44** | 57.10 | 41.39 |
+| HGRN ELSA-official (Aug 31, not saved) | unstructured | 54.08 | 36.92 | -- | -- |
+| OPT-125M dense | -- | 27.61 | 26.52 | 27.66 | 25.17 |
+| OPT-125M ELSA paper (appendix table) | unstructured | 65.30* | 47.74* | | |
+| OPT-125M ELSA-official, row-wise | semi | *running* | | | |
+| OPT-125M one-phase r128, full H (rerun; original 80.69 / 50.21) | semi, 0.7997 | **84.18** | **55.87** | 84.37 | 50.47 |
+| OPT-125M local Phase 1 + Phase 2 r128 (rerun; original 83.35 / 52.70) | semi, 0.7997 | **80.26** | **58.11** | 80.43 | 52.45 |
+| OPT-125M two-phase `dualrescale` r128 (rerun; original 80.89 / 51.55) | semi, 0.7997 | **80.45** | **56.97** | 80.62 | 51.52 |
+| OPT-125M one-phase r64 (rerun; original 91.32 / 54.01) | semi, 0.7997 | **89.33** | **60.03** | 89.53 | 54.16 |
+| OPT-125M local r64 (rerun; original 86.37 / 56.26) | semi, 0.7997 | **89.84** | **62.54** | 90.03 | 56.21 |
+| OPT-125M local r32 | semi | *running* | | 104.35 / 63.95 (orig) | |
+
+\* Paper numbers; the paper's dense row (27.65 / 26.56) is ~0.15% off ELSA's released code, so treat its pruned numbers as approximate under the exact protocol.
+
+- On HGRN two-phase the two protocols differ by only ~1-2% (87.73 vs 88.23 WT2, 55.46 vs 56.79 C4).
+- **HGRN, like-for-like under ELSA's own protocol:** our one-phase *semi-structured* (56.57 / 40.44) is within **1.05x / 1.10x** of ELSA-official *unstructured* (54.08 / 36.92), even with the stricter constraint. Our two-phase is 1.62x / 1.50x. ELSA under the row-wise constraint has not been run on HGRN, only on OPT-125M (running).
+- **In-pipeline check:** all three OPT-125M reruns printed dense ELSA-protocol PPL = 27.611 / 26.521, identical to ELSA-official's own code, so the `run_pipeline.py` integration is verified too.
+
+**Problem: CPU contention slows the ELSA row run.** Its tokenization of 32,768 C4 sequences ran at ~16 seq/s alone, but dropped to ~2.9 seq/s (ETA ~2h20m) once the 3 OPT reruns and the HGRN eval started on the same node. The node has 1 CPU core (see the Anvil notes). No failure, only delay. Next time, build ELSA's tokenized cache (`ELSA-official/dataset/facebook_opt-125m/...`, written by `--admm_save_inputs=True`) before starting parallel jobs. This run writes it, so later ELSA OPT-125M runs load it in seconds.
+
+## Session 13 notes: planning discussions (2026-09-30)
+
+### Could fixing the *global* Phase 1 (instead of replacing it) help?
+
+User asked: fix the old global Phase 1 so it hands Phase 2 an already-pruned model (target 80% instead of 70%, a real penalty such as lambda 1e-3 constant so x converges to z, handoff x = z) and rerun with `dualrescale`. Assessment, from evidence already on disk:
+- Session 11 `p1lam-const` (global Phase 1 with lambda 1e-3 constant, so x much closer to pruned) scored 82.03 / 51.80, *slightly worse* than `dualrescale` 80.89 / 51.55.
+- Session 2: raising Phase 1's target 70% -> 85% made C4 much worse (139.1 vs 53.9). That was pre-lambda-fix, so it's weak evidence.
+- Session 12: local Phase 1 handing over a fully pruned 80% model was also worse (83.35 / 52.70).
+- So far, every move toward a pruned Phase 2 start made results worse, and the best results started Phase 2 near-dense. The fix also keeps the ~70 min global Phase 1, so two-phase would stay ~2.6h vs one-phase ~1.5h.
+- It is still worth running as one cell of a **2x2** that separates the handoff from the objective:
+
+| | Phase 2 starts near-dense | Phase 2 starts pruned |
+|---|---|---|
+| Global Phase 1 (CE+KD) | have: 80.89 / 51.55 | to run: 80% target, lambda 1e-3, x = z |
+| Local Phase 1 (reconstruction) | to run: dense-start handoff (x = W0, z = local mask, u = 0) | have: 83.35 / 52.70 |
+
+- If both "pruned" cells lose, the handoff is the problem: keep a dense Phase 2 start and use local Phase 1. If the global-pruned cell wins, the CE+KD objective matters and Phase 1 needs a cheaper CE+KD variant. **Not run yet.** It needs a small option for what Phase 2 starts from (Phase 1's x / pruned z / dense W0).
+
+### Roadmap toward a NeurIPS submission (user constraints: keep two-phase, local Phase 1 + global CE+KD Phase 2, semi-structured)
+
+**1. Framing (blocking).**
+- Compare against ELSA *under the same row-wise constraint* (now running), plus SparseGPT/Wanda/ALPS under it. Unstructured ELSA is a reference ceiling, not the main comparison.
+- Semi-structured needs a hardware reason: a **measured** speedup or memory saving from row-balanced sparse kernels (ELL / balanced-sparsity formats). Otherwise it reads as a handicap.
+
+**2. The claim two-phase has to earn** (strongest first):
+1. **Phase 1 decides where to prune:** local Phase 1's per-layer reconstruction error (~3 min) is a cheap sensitivity signal. Use it for non-uniform per-layer sparsity, with rows within a layer kept uniform, so it stays semi-structured. ELSA is uniform. Published methods (e.g. OWL) gain a lot from non-uniform allocation at 70%+. This was "menu option 1", never built.
+2. **Same quality for less compute:** a perplexity vs GPU-hours curve.
+3. Better quality at equal compute.
+
+**3. Technical tiers.**
+- **Tier 1 (fix):**
+  - The handoff: dense-start, or a Phase 2 sparsity ramp.
+  - Known Phase 2 gaps vs ELSA: 32,768 unique calibration sequences vs our 2,048 resampled; ELSA also trains LayerNorms, embeddings and lm_head.
+- **Tier 2 (method):**
+  - Phase 1-informed per-layer allocation.
+  - An error-correcting local objective (match dense-model outputs, not the dense layer on pruned inputs), or block-wise reconstruction.
+  - Hidden-state KD in Phase 2.
+- **Tier 3 (paper):**
+  - Models: OPT-125M/1.3B, a LLaMA-family model (7B needs FSDP or 8-bit Adam on 40 GB A100s), HGRN as the non-transformer.
+  - Sparsity 50-90%, 3 seeds, zero-shot (needs ELSA's `lm_eval` fixed), GPU-hour accounting, the speedup measurement, ablations.
+
+**Order chosen by the user:** item 1 first (ELSA row-wise baseline), then ELSA-protocol eval for all models (above).
+
+## Housekeeping (2026-09-29/30)
+
+- **Deleted stale Phase 1 checkpoints** on scratch (14.4 GB, user approved): `ehws-checkpoints/{hgrn-1.3b-dualphase-0.8-lr3x-ncalib2048-savemodel, opt-125m-extreme-ncalib2048-nolr3x, opt-125m-extreme-obscorrect}/phase1_checkpoint.pt`. All predate the Session 10 checkpoint-meta change, so they couldn't be resumed anyway.
+- **Moved the HF cache to scratch** (user approved): `~/.cache/huggingface/{hub,datasets}` are now symlinks to `/anvil/scratch/x-kgholami/hf-cache/`. The copy was verified with `diff -r` and an offline model/dataset load. The login token stays on home. Home went from 94% to 58% of its 25 GB quota.
+- **Still kept:** both HGRN `model.safetensors` (final results, not resume checkpoints). `~/.cache/pip` (5.9 GB, deletable) was not touched.
+- **Watchdogs** (all detached, 2-min poll; check process, log errors, GPU mem >39 GB / temp >85C / ECC, host RAM, home quota >97.5%, walltime):
+  - `results/_s12_sweep/watchdog.sh` (done)
+  - `ELSA-official/results/opt-125m-0.8-row/watchdog.sh`
+  - `results/_elsa_protocol_eval/watchdog.sh`
+- **Uncommitted:** all Session 12-13 code (`ehws/admm.py`, `ehws/calibration.py`, `ehws/perplexity.py`, `run_pipeline.py`, `eval_external.py`) and this file. The `ELSA-official` patch is local only.
+
+### OPT-125M one-phase rerun (finished 2026-09-30 22:49): two findings
+
+**1. Under ELSA's protocol, our OPT-125M C4 gap is much larger than we thought.**
+- Our one-phase scores C4 50.47 on our C4 set but **55.87 on ELSA's**. On dense the two sets differ by only ~5% (25.17 vs 26.52), but the pruned model loses ~11% more on ELSA's set.
+- Earlier sessions compared our-protocol C4 (50.21) with ELSA's paper (47.45/47.74) and called it "within ~6%". Measured the same way, it's **55.87 vs 47.74 = 1.17x**, and WT2 84.18 vs 65.30 = 1.29x. That's against *unstructured* ELSA; ELSA row-wise is still running.
+
+**2. Run-to-run variance is larger than assumed.**
+- Same config as Session 9's one-phase (`--skip-phase1 --p2-rounds 128`, full H, same calibration cache and seed), rerun: WT2 **84.37** vs 80.69 (+4.6%), C4 50.47 vs 50.21 (+0.5%).
+- Code changes since Session 9 that touch this path (diagonal-only H, single-pass cold-start Hessians) were verified bit-exact on a toy model in Session 10, so the likeliest cause is GPU non-determinism (fp32 atomics in backward) compounding over 4096 steps. The Session 9 relaxed-ADMM `alpha=1.0` regression check showed a smaller swing (85.98 -> 84.79).
+- **Consequences:** single-seed WT2 differences under ~5% (e.g. Session 12's local vs one-phase, Session 11's `rescale` vs `p1lam-const`) are not reliable. A paper needs 3+ seeds with mean ± std. C4 looks much more stable than WT2.
+
+**Bug found and fixed: `--save-model` crashed on OPT** (any model with tied weights). safetensors refuses tensors that share memory, and OPT's `lm_head.weight` *is* `embed_tokens.weight`. HGRN has no tied weights, which is why its saves worked. Results were unaffected: `results.json` is written before the save. Fix in `run_pipeline.py`: skip tensors whose storage was already saved. Verified the round trip on OPT-125M: reload reports only `lm_head.weight` missing, and it comes back equal to the original and still tied to the embedding.
+- Runs that started before the fix (one-phase r128 and r64, `dualrescale` r128, local r128, **and local r64**) have no saved weights. local r64 started seconds before the edit landed: its traceback points at the pre-fix line 536. Only local r32 (started ~23:58) saves weights. All results are complete regardless.
+
+**local r128 rerun (22:51; save also failed, started pre-fix):** WT2 80.43 / C4 52.45 under our protocol (original 83.35 / 52.70, so -3.5% on WT2 between identical runs), and **80.26 / 58.11** under ELSA's. Against the one-phase rerun (84.18 / 55.87 ELSA protocol): local is **better on WT2 (-4.7%) and worse on C4 (+4.0%)**. That's the same split as Session 12's 64-round pair (local 86.37 / 56.26 vs one-phase 91.32 / 54.01). The WT2 noise is about the size of the gap, but the C4 direction has now held three times (r64, r128 original, r128 rerun). Local Phase 1 looks like it trades C4 (the calibration domain) for WT2. That fits its reconstruction objective preserving dense-model behaviour rather than adapting to C4. Not settled without seeds.
+
+**Three more reruns (23:50):**
+
+| OPT-125M @80%, ELSA protocol (WT2 / C4) | 128 rounds | 64 rounds |
+|---|---|---|
+| One-phase | 84.18 / **55.87** | **89.33 / 60.03** |
+| Two-phase `dualrescale` (global Phase 1) | 80.45 / 56.97 | -- |
+| Two-phase local Phase 1 | **80.26** / 58.11 | 89.84 / 62.54 |
+| *ELSA paper, unstructured* | *65.30 / 47.74* | |
+
+- **Reproducibility (our protocol, rerun vs original):** `dualrescale` 80.62 / 51.52 vs 80.89 / 51.55, one-phase r64 89.53 / 54.16 vs 91.32 / 54.01, local r64 90.03 / 56.21 vs 86.37 / 56.26. **C4 reproduces within 0.5% every time; WT2 moves by up to ~4.6%.** Use C4 for single-seed decisions at this scale.
+- **On C4, the stable metric, one-phase wins at both lengths:** 55.87 vs 56.97 (`dualrescale`) and 58.11 (local) at r128, and 60.03 vs 62.54 (local) at r64. On WT2 both two-phase variants win at r128, but by less than the observed noise.
+- **Local r64 is now worse than one-phase r64 on both metrics.** The original r64 pair split (local better on WT2), but the rerun's WT2 swing erased that. The Session 12 "mixed" verdict was noise on WT2. The C4 deficit was real both times.
+- **Takeaway:** with seed noise accounted for, no two-phase variant beats one-phase on C4 yet. Together with the HGRN gap (one-phase 56.57 / 40.44 vs two-phase 87.73 / 55.46, ELSA protocol), this keeps the handoff/2x2 experiment and seeds as the priority before scaling up.
+
+## Session 14 (2026-10-06): HGRN-1.3B two-phase with local (ALPS) vs global (`dualrescale`) Phase 1; ELSA row-wise on HGRN
+
+**Setup** (`results/_s14_hgrn/launch.sh`; outputs in `/anvil/scratch/x-kgholami/ehws-exp-out/s14-hgrn/`): HGRN-1.3B @80%. Phase 2 uses the best HGRN config (lr 6e-4, lambda 0.01 constant, beta2 0.95), `--p2-dual-init rescale`, and `--hessian-n-calib 256`. One arm per GPU. Before launch, both modes were smoke-tested on HGRN. Phase 2 static memory was ~33 GB, and both arms peaked at 32.8 GB at full size. The HGRN calibration cache (`fla-hub_hgrn-1.3B-100B_{calib,c4eval,wt2}_*.pt`) now exists in `ehws-calib-cache`.
+
+**From now on, all PPL is reported under the ELSA protocol only (WT2 and C4), per the user.**
+
+| HGRN-1.3B @80% (ELSA protocol) | WT2 | C4 | Zero-shot avg | Phase 1 | Phase 2 |
+|---|---|---|---|---|---|
+| Two-phase, **local (ALPS) Phase 1** | **71.41** | **45.87** | 0.371 | 613s | 11415s |
+| Two-phase, global Phase 1, `dualrescale`, H 256 | 102.88 | 61.02 | 0.363 | 15223s | 10702s |
+| Old two-phase, global Phase 1, carry dual, full H (Sep 15) | 87.73 | 55.46 | 0.357 | | |
+| One-phase (Sep 16) | 56.57 | 40.44 | | -- | |
+| ELSA official, unstructured | 54.08 | 36.92 | | | |
+| ELSA official, row-wise | 58.79 | 40.30 | | | (see Session 15) |
+
+- **Local Phase 1 beats global Phase 1 by a wide margin on HGRN**: -31% WT2 and -25% C4 against `dualrescale`, and -19% / -17% against the old two-phase, at less than half the wall-clock. The OPT-125M arms were roughly tied, so this difference shows up only on HGRN.
+- **`dualrescale` + H 256 is worse on HGRN than the old carry/full-H two-phase** (102.88 / 61.02 vs 87.73 / 55.46). This is the opposite of OPT-125M, where `rescale` was best. Two things changed at once (dual init and Hessian size), so the cause isn't isolated. Single seed.
+- **One-phase is still best** (56.57 / 40.44). Local two-phase trails it by 1.26x / 1.13x.
+- Local Phase 1's average per-layer reconstruction error fell from 0.154 to 0.055. The MLP projections stay the hardest (0.08-0.10).
+- **HF:** the local arm is uploaded to `ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct` (public; SHA-256 verified; local copy deleted). The global arm's weights are still at `s14-hgrn/global-dualrescale/model-s0.8`, and its Phase 1 checkpoint is still at `ehws-checkpoints/global-dualrescale/`.
+
+**ELSA row-wise on HGRN** (`ELSA-official/results/hgrn-1.3b-0.8-row/launch.sh`): same as the Aug 31 unstructured run, plus `--admm_comparison_group=row` and `--save_model=True`, with zero-shot off. Launched 2026-10-06 19:05 on GPU 1. GPU memory reached ~40.3 GB at each projection (allocator cache) and sat at ~36 GB between projections, with no OOM. **Result in Session 15.**
+
+**ELSA row-wise on OPT-125M (finished 2026-10-01, not recorded earlier):** 75.86 / 53.45 (ELSA protocol). That beats all of our OPT-125M variants (best: one-phase r128 84.18 / 55.87). local r32 rerun: 102.80 / 71.00.
+
+## Session 15 (2026-10-06/07): why HGRN global + `dualrescale` was worse, and ELSA row-wise on HGRN
+
+All PPL is under the ELSA protocol. HGRN-1.3B @80%, single seed.
+
+### Diagnosis (code read, before running anything)
+
+No HGRN-specific bug was found in the `rescale` code path. It does what it should, but its effect depends on the model:
+- `rescale` multiplies Phase 1's scaled dual by `lambda_p1 / lambda_p2`. Phase 1's lambda is still the untuned default **5e-5 (cosine)** for every model. Phase 2's lambda comes from ELSA: 1e-3 for OPT-125M (paper Table 5) and **1e-2 for HGRN** (ELSA's own HGRN log, Session 5). So the factor is 0.05 on OPT but **0.005 on HGRN**, which effectively zeroes the dual. Confirmed in the logs: Phase 2 round-1 `max ||u||/||x0||` was 0.68 (rescale) vs 2.37 (old carry run) vs 0.75 (one-phase, no dual).
+- **What wasn't ported to HGRN:** the Session 10 runbook (line ~1349) said to use `--p1-lambda 1e-2` when moving to HGRN. That was never done. Phase 1's lr (2e-4) was never tuned for HGRN either.
+- The HGRN dual plateau (`max ||u||/||x0||` ~1.4 from round ~8 on, vs ~0.4 on OPT) is **normal for HGRN at lambda 0.01**. One-phase, the best run, shows the same plateau. The local arm stays at ~0.02 because its Phase 2 starts from the pruned weights.
+- The s14 comparison was also confounded with `--hessian-n-calib 256` (the old run used the full H).
+
+### Ablations (`results/_s15_hgrn/launch.sh`; outputs in `/anvil/scratch/x-kgholami/ehws-exp-out/s15-hgrn/`)
+
+Same as s14 `global-dualrescale` (Phase 2: lr 6e-4, lambda 0.01 constant, beta2 0.95; H 256) except:
+
+| HGRN-1.3B @80% (ELSA protocol) | WT2 | C4 | Zero-shot avg | Phase 2 round-1 dual |
+|---|---|---|---|---|
+| ELSA official, **unstructured** | 54.08 | 36.92 | | |
+| **One-phase (Sep 16)** | **56.57** | 40.44 | | 0.75 |
+| **ELSA official, row-wise (same constraint as ours)** | 58.79 | **40.30** | -- | |
+| Two-phase, local (ALPS) Phase 1 (s14) | 71.41 | 45.87 | 0.371 | 0.02 |
+| Two-phase, global, **`p1lam-const`** (Phase 1 lambda 1e-2 constant = Phase 2's, so rescale is a no-op) | 76.27 | 48.64 | 0.370 | 2.03 |
+| Old two-phase, global, carry, full H (Sep 15) | 87.73 | 55.46 | 0.357 | 2.37 |
+| Two-phase, global, **`carry-h256`** | 90.63 | 55.72 | 0.356 | 2.34 |
+| Two-phase, global, `dualrescale`, H 256 (s14) | 102.88 | 61.02 | 0.363 | 0.68 |
+
+Timing (3 jobs sharing the node's 1 CPU): Phase 1 ~18,300-18,500s (~5.1h) per global arm, Phase 2 ~11,750s. GPU peak 32.8 GB per EHWS arm. ELSA row-wise: 33,660s train (9.35h), ~40.3 GB peak.
+
+### What it means
+
+- **The 256-sample Hessian is not the cause.** `carry-h256` vs the old carry/full-H run: +3.3% WT2 / +0.5% C4, about the same cost seen on OPT (Session 11) and within run-to-run noise.
+- **`rescale` is the cause on HGRN.** At the same H, `rescale` is 13.5% / 9.5% worse than `carry`. That's the opposite of OPT-125M, where rescale beat carry by 7.1% / 4.1%. On HGRN, the 0.005 factor throws away Phase 1's dual direction.
+- **Matching Phase 1's lambda to Phase 2's is the real fix:** `p1lam-const` is the best global two-phase HGRN result so far, -26% / -20% vs `dualrescale` and -13% / -12% vs the old carry run. On OPT the same setting only tied rescale (82.03 vs 80.89 our protocol), so it matters much more on HGRN. **Recommendation:** for any model, set `--p1-lambda` to Phase 2's lambda with a constant schedule, rather than relying on `rescale`. Better still, make Phase 1's lambda default to Phase 2's.
+- **Local (ALPS) Phase 1 still beats every global Phase 1** (71.41 / 45.87), at ~1/30 of the Phase 1 cost.
+- **Headline: on HGRN, our one-phase semi-structured EHWS matches ELSA under the same row-wise constraint.** WT2 56.57 vs 58.79 (-3.8%) and C4 40.44 vs 40.30 (+0.3%). Both are single seeds. On OPT-125M, ELSA row-wise still wins (75.86 / 53.45 vs one-phase 84.18 / 55.87). The row-wise constraint costs ELSA +8.7% WT2 / +9.2% C4 on HGRN relative to its unstructured run.
+- Every two-phase variant still trails one-phase on HGRN. The gap is now 1.26x / 1.13x (local) and 1.35x / 1.20x (`p1lam-const`).
+
+### Next
+
+1. Combine the two winners: local Phase 1 with a **dense-start handoff** (Session 12, next item 1). Local Phase 1 currently hands over pruned x with u = 0.
+2. Global Phase 1 with matched lambda **and** a target of 0.8 instead of 0.7 (the remaining 2x2 cell from Session 13).
+3. Seeds for the headline comparison (one-phase vs ELSA row-wise on HGRN), since WT2 noise is ~3-5%.
+4. Consider making `--p1-lambda` default to Phase 2's lambda (constant) in `run_pipeline.py`. Not changed yet.
+
+### Weights on scratch (not uploaded)
+
+- `ehws-exp-out/s14-hgrn/global-dualrescale/model-s0.8`
+- `ehws-exp-out/s15-hgrn/{p1lam-const,carry-h256}/model-s0.8` (2.7 GB each)
+- ELSA row-wise: `/anvil/scratch/x-kgholami/elsa-out/hgrn-1.3b-0.8-row/*/` (2 shards)
+
+Leftover Phase 1 checkpoints, if any, are in `ehws-checkpoints/{global-dualrescale,p1lam-const,carry-h256}`. The local arm is on HF: `ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct`.
+
+### Session 15 audit: HGRN-only precision mismatch with ELSA (found 2026-10-07, not yet tested)
+
+- **EHWS trains HGRN in pure bf16:** weights, Adam state, and x/z/u are all bf16 (`--dtype bfloat16`). Phase 2 runs Adam (lr 6e-4, linear decay to 0) directly on bf16 weights. bf16 keeps ~8 mantissa bits (relative step ~0.4%), so small Adam and proximal updates, especially late in the lr decay, are partly rounded away.
+- **ELSA trains HGRN with fp32 master weights.** `ELSA-official/lib/utils.py::get_llm` loads without `torch_dtype` (transformers 4.45 -> float32), and `--admm_precision bf16` only turns on Trainer autocast. Confirmed on disk: ELSA's row-wise HGRN model is saved as float32 (`config.json` `torch_dtype: float32`, 5.46 GB). Only ELSA's dual and split variables were bf16 in its HGRN run.
+- **OPT-125M was always run in float32**, so no OPT result was ever affected. This is the main remaining HGRN-only difference from ELSA, and it hits every HGRN EHWS result (one-phase included).
+- **Fix to test:** fp32 master weights for the trainable linears only (fp32 copy in the optimizer, bf16 autocast forward; teacher stays bf16). Memory needs checking: Phase 2 already peaks at 32.8 GB in bf16, so fp32 Adam state (~10 GB) needs z/u kept in bf16 and the duplicate `x` clones dropped, or an 8-bit/paged optimizer.
+
+### Ideas to improve local (ALPS) two-phase on HGRN, ranked
+
+1. **Fix the bf16 training above.** It affects all HGRN runs, so test it on one-phase too.
+2. **Dense-start handoff** (`x = W0`, `z = local mask/weights`, `u = 0`). Local Phase 2's dual stays ~0.02 the whole run, so starting pruned leaves Phase 2 almost no room to move the support. Every good run started dense or near-dense.
+3. **Phase 2 hyperparameters for a pruned start:** lr and lambda were tuned for a dense start. Try a higher lr or a lower lambda, and/or a lower local target (0.7) so that Phase 2 does the last 10%.
+4. **Better local objective:** error-correcting targets (the dense model's outputs, not the dense layer on pruned inputs), block-wise reconstruction, and the full Hessian (local Phase 1 is cheap, so `--hessian-n-calib` 2048 is affordable). The refit is a no-op (ADMM already converges on the support), so the rounds/refit are not the bottleneck.
+5. **ELSA-parity items that apply to every run:** train LayerNorms/embeddings/lm_head (ELSA does); 32,768 unique calibration sequences vs our 2,048 resampled.
+
+## Session 16 (2026-10-07/08): items 1/2/3/6 implemented; HGRN local two-phase run queued on job 21177562
+
+**Code (all opt-in flags; defaults reproduce earlier runs, apart from the deliberate changes below):**
+- `--master-fp32` (with `--dtype bfloat16`): the student is fp32 (weights, grads, Adam), its forward runs under bf16 autocast (`cache_enabled=False`), the teacher stays bf16, Phase 2 `z`/`u` are bf16 (ELSA's HGRN setup). Enables TF32 for fp32 eval matmuls.
+- `--elsa-train-cache DIR`: trains on ELSA's tokenized set (`ELSA-official/dataset/<model>/train/c4_32768_2048_hub`). The first use converts it to `<calib-cache>/<model>_elsatrain_<name>.pt` (537 MB).
+- `--p2-epoch-sampling`: Phase 2 batches are drawn without replacement (`EpochSampler`); 4096 x 8 = 32,768 = one pass.
+- `--p2-train-extra`: Phase 2 also trains every non-pruned parameter (norms, embeddings, lm_head, HGRN lower bounds) with the same Adam/lr and no penalty.
+- `--p2-hessian-refresh`: each Z-step uses diag(H) re-measured from the x-step's own student forwards since the previous Z-step (pre-hooks, no extra passes). Needs diagonal Hessians.
+- **Deliberate behavior changes:**
+  - `run_phase2` no longer keeps `s.x` or a `z - u` copy per layer. The prox target is formed per module, in fp32, when it's used (`_x_step` now takes `(module, z, u)`).
+  - Each Z-step is computed in fp32 from the live weight. The final commit uses the fp32 projection.
+  - Phase 2 logs `||x-z||/||x||` (and `diagH_drift`) every round. Grads are freed before eval.
+  - Local Phase 1 keeps its handoff tensors on CPU.
+- **Verified:**
+  - A CPU smoke test (OPT-125M, all flags, Phase 1 local -> Phase 2 -> eval -> fp32 save) ran clean.
+  - The refresh hook matches `_compute_hessians` on identical inputs (max rel err 3e-4).
+  - The drift metric's noise floor between disjoint 4x512-token samples is 0.04-0.6, so the smoke's 1.5 (1 vs 4 short sequences) is sampling noise. Real runs refresh from 256 x 2048 tokens.
+- **Not yet verified on GPU** (fla Triton kernels under autocast with fp32 weights, and the 40 GB budget). The GPU smoke stage below is the gate.
+
+**Run:** `results/_s16_hgrn/` (`common.sh` holds the exact args: the Session 14 local config + `--master-fp32 --elsa-train-cache ... --p2-epoch-sampling --p2-train-extra --p2-hessian-refresh`). Output goes to `/anvil/scratch/x-kgholami/ehws-exp-out/s16-hgrn/local-fp32-elsadata-extra-hrefresh`.
+- `wait_and_launch.sh` (detached on **login00**) polls job 21177562 and, once it's RUNNING, SSHes to its node and starts `launch.sh`.
+- `launch.sh` runs a GPU smoke test first (real HGRN, 3 short Phase 2 rounds, eval + save, nvidia-smi sampled every 5 s). It starts the full run only if the smoke exits 0 with peak memory <= 39.5 GB.
+- `watchdog.sh` logs health every 2 minutes and writes warnings and errors to `status.txt`.
+- If login00's watcher dies (login-node reboot), run `bash results/_s16_hgrn/launch.sh` by hand inside the session.
+- Phase 1 lr/lambda (`p1lam-const`, Session 15) only apply to *global* Phase 1. Local Phase 1 has no lr or lambda (it uses the rho schedule), so they aren't part of this run.
+
+**Cleanup (2026-10-07):**
+- Deleted the five finished-run Phase 1 resume checkpoints on scratch (7.5 GB) plus about 70 empty checkpoint folders, `~/.cache/pip` (5.9 GB), `ehws-exp-out/smoke-hgrn`, and the empty `scratch/exp`. /home went from 62% to 40%.
+- Kept every saved model, ELSA's dataset caches, `hf_cache` (unclear owner), and `sparse-llms-on-loihi` (another project).
+
+### Session 16 result (2026-10-09 02:16): best HGRN-1.3B @80% result of the project, ahead of ELSA under both constraints
+
+Job 21177562 started 2026-10-08 22:19 on g003. The watcher launched `launch.sh` at 22:21, the GPU smoke test passed at 22:34, and the full run finished at 02:16.
+- Phase 1 (local): 603s. Phase 2: 11,917s. Peak GPU memory 34.1 GB in the full run, 36.1 GB in the smoke test.
+
+| HGRN-1.3B @80% (ELSA protocol) | WT2 | C4 | Zero-shot avg |
+|---|---|---|---|
+| **Two-phase local + fp32 master + ELSA data + extras + H refresh (s16)** | **46.49** | **34.58** | 0.377 |
+| ELSA official, unstructured | 54.08 | 36.92 | -- |
+| One-phase (Sep 16, bf16, 2,048 seqs) | 56.57 | 40.44 | -- |
+| ELSA official, row-wise (same constraint) | 58.79 | 40.30 | -- |
+| Two-phase local, Session 14 (bf16, 2,048 seqs) | 71.41 | 45.87 | 0.371 |
+| Dense | 11.81 | 16.10 | 0.435 |
+
+- **Independently re-scored** with `eval_external.py` on the saved weights: sparsity 0.7999, `rows_uniform=True`, and the same 46.488 / 34.575.
+- Against Session 14 local: -35% WT2 / -25% C4. Against ELSA row-wise: -21% / -14%. It also beats ELSA unstructured (-14% / -6%).
+- Phase 2 dynamics: `||x-z||/||x||` stays at 0.011-0.016 and falls to 0.0022 by round 128, so the final projection costs almost nothing. `max ||u||/||x0||` stays ~0.02 (pruned start). `diagH_drift` is 1.34 at round 1, then 0.21-0.29 for the rest of the run.
+- **Caveats:**
+  - Single seed.
+  - Four changes at once, so the gain isn't attributed to any one of them.
+  - Zero-shot improves much less than PPL (0.377 vs 0.371). ELSA row-wise zero-shot was never measured.
+  - The extras trained at lr 6e-4 vs ELSA's 2e-4.
+  - The one-phase baseline hasn't been rerun with the same fixes, so "two-phase beats one-phase" is not shown yet.
+- **Weights:** `ehws-exp-out/s16-hgrn/local-fp32-elsadata-extra-hrefresh/model-s0.8/` (fp32, 5.5 GB, not uploaded).
+- **Bug fixed after the run:** `launch.sh`'s memory gate compared MiB as strings (it reported 9,465 vs a true 36,141 MiB peak). It now compares numerically. The run itself was unaffected: the true peak was under 39.5 GB.

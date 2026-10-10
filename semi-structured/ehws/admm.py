@@ -56,6 +56,7 @@ available, not a value tuned for this specific pairing.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import math
@@ -69,6 +70,48 @@ from .hessian import LayerHessian
 from .losses import combined_loss
 from .model_layers import PrunableLayer
 from .obs_projection import obs_project
+
+# Mixed precision for the student's forward passes (`--master-fp32`): weights,
+# grads and Adam state stay float32 (master copy) and matmuls run in this dtype
+# under autocast -- what ELSA's HF Trainer does with `bf16=True` on an fp32
+# model. None = no autocast (the model runs in its own storage dtype).
+_AUTOCAST_DTYPE: torch.dtype | None = None
+
+
+def set_autocast_dtype(dtype: torch.dtype | None) -> None:
+    global _AUTOCAST_DTYPE
+    _AUTOCAST_DTYPE = dtype
+
+
+def _student_autocast(device) -> contextlib.AbstractContextManager:
+    if _AUTOCAST_DTYPE is None:
+        return contextlib.nullcontext()
+    # cache_enabled=False: don't keep a bf16 copy of every weight alive for the
+    # whole forward (~2.7GB on HGRN-1.3B); casts are redone per use instead.
+    return torch.autocast(torch.device(device).type, dtype=_AUTOCAST_DTYPE, cache_enabled=False)
+
+
+class EpochSampler:
+    """Draw calibration batches without replacement, reshuffling after each pass.
+
+    ELSA's Trainer walks its 32,768 training sequences once in random order;
+    `_sample_batch` draws with replacement instead. With 4096 steps x 8
+    sequences this sampler sees each of 32,768 sequences exactly once.
+    """
+
+    def __init__(self, calib_ids: torch.Tensor, seed: int = 0):
+        self.calib_ids = calib_ids
+        self.gen = torch.Generator().manual_seed(seed)
+        self.perm = torch.randperm(calib_ids.shape[0], generator=self.gen)
+        self.pos = 0
+
+    def __call__(self, n: int, device) -> torch.Tensor:
+        if self.pos + n > len(self.perm):
+            self.perm = torch.randperm(self.calib_ids.shape[0], generator=self.gen)
+            self.pos = 0
+        idx = self.perm[self.pos : self.pos + n]
+        self.pos += n
+        return self.calib_ids[idx].to(device)
 
 
 @dataclasses.dataclass
@@ -288,6 +331,21 @@ class Phase2Config:
     beta1: float = 0.9
     beta2: float = 0.999  # PyTorch's Adam stock default; real ELSA sets 0.95 (ELSA-official/lib/trainer.py's admm_beta2) -- see run_pipeline.py's --adam-beta2
     prox_after_clip: bool = True  # add the ADMM penalty gradient after clip_grad_norm_ instead of inside the backpropped loss, matching real ELSA's _proximal_update (see _x_step's docstring). Made default 2026-09-11 -- beat prior default on both WT2/C4 in the opt-125m-fixablation ablation, see PROGRESS.md
+    # Storage dtype for z and u (None = the weight's own dtype). ELSA's HGRN run
+    # kept its split/dual in bf16 (--admm_split_dtype/--admm_dual_dtype bf16).
+    state_dtype: torch.dtype | None = None
+    # Also train every non-pruned parameter (norms, embeddings, lm_head, HGRN's
+    # forget-gate lower bounds) with the same Adam/lr, no ADMM penalty -- what
+    # ELSA's create_optimizer does ("other_params" group).
+    train_extra: bool = False
+    # Re-measure diag(H) for the Z-step from the x-step's own student forwards
+    # (inputs of every prunable layer, accumulated since the previous Z-step),
+    # so the Hessian score tracks the network as it's pruned. No extra passes.
+    hessian_refresh: bool = False
+    damping: float = 0.01  # same ridge as the initial Hessian, applied to refreshed diagonals
+    # Draw Phase 2 batches without replacement (EpochSampler) instead of with.
+    epoch_sampling: bool = False
+    seed: int = 0
 
 
 def _k_keep(n_in: int, sparsity: float) -> int:
@@ -316,6 +374,7 @@ def _set_trainable(modules: list[nn.Linear], flag: bool) -> None:
 
 def _build_optimizer(
     trainable_modules: list[nn.Linear], lr: float, betas: tuple[float, float] = (0.9, 0.999),
+    extra_params: list[torch.nn.Parameter] | None = None,
 ) -> torch.optim.Optimizer:
     """One Adam instance over every trainable module's weight (+ bias).
 
@@ -342,6 +401,7 @@ def _build_optimizer(
         params.append(m.weight)
         if m.bias is not None:
             params.append(m.bias)
+    params += list(extra_params or [])
     return torch.optim.Adam(params, lr=lr, betas=betas, foreach=False)
 
 
@@ -375,7 +435,7 @@ def _x_step(
     model: nn.Module,
     teacher: nn.Module,
     trainable_modules: list[nn.Linear],
-    prox_targets: list[tuple[nn.Linear, torch.Tensor]],
+    prox_targets: list[tuple[nn.Linear, torch.Tensor, torch.Tensor]],
     calib_ids: torch.Tensor,
     n_steps: int,
     micro_batch: int,
@@ -390,6 +450,8 @@ def _x_step(
     kd_temperature: float = 1.0,
     betas: tuple[float, float] = (0.9, 0.999),
     prox_after_clip: bool = True,
+    extra_params: list[torch.nn.Parameter] | None = None,
+    sampler=None,
 ) -> torch.optim.Optimizer:
     """Run n_steps of Adam minimizing f(x) + (lambda/2)||x-target||_F^2.
 
@@ -428,8 +490,17 @@ def _x_step(
     real-ELSA analogue to match, and its optimizer is rebuilt fresh every
     call anyway (see above), so there's no single continuous run for a
     schedule to decay across.
+
+    ``prox_targets`` is a list of ``(module, z, u)``; the penalty pulls the
+    module's weight toward ``z - u``. The target is formed per module, in
+    float32, when it's used rather than stored, so Phase 2 doesn't keep an
+    extra full copy of every weight alive.
+
+    ``extra_params`` (Phase 2 ``train_extra``) are trained by the same
+    optimizer and clipped with everything else, with no penalty. ``sampler``
+    (``EpochSampler``) replaces sampling with replacement.
     """
-    for p, _ in prox_targets:
+    for p, _, _ in prox_targets:
         p.weight.requires_grad_(True)
         if p.bias is not None:
             p.bias.requires_grad_(True)
@@ -438,15 +509,20 @@ def _x_step(
         params.append(m.weight)
         if m.bias is not None:
             params.append(m.bias)
+    params += list(extra_params or [])
     if opt is None:
         opt = _build_optimizer(trainable_modules, lr, betas=betas)
+
+    def target(z, u, like):
+        return (z.float() - u.float()).to(like.dtype)
 
     model.train()
     for _ in range(n_steps):
         opt.zero_grad(set_to_none=True)
         for _ in range(grad_accum):
-            batch = _sample_batch(calib_ids, micro_batch, device)
-            student_logits = model(input_ids=batch, use_cache=False).logits
+            batch = sampler(micro_batch, device) if sampler is not None else _sample_batch(calib_ids, micro_batch, device)
+            with _student_autocast(device):
+                student_logits = model(input_ids=batch, use_cache=False).logits
             with torch.no_grad():
                 teacher_logits = teacher(input_ids=batch, use_cache=False).logits
             loss, _ = combined_loss(student_logits, teacher_logits, batch, alpha_kd, kd_temperature)
@@ -457,14 +533,14 @@ def _x_step(
                 (loss / grad_accum).backward()
             else:
                 prox = student_logits.new_zeros(())
-                for module, target in prox_targets:
-                    prox = prox + 0.5 * admm_lambda * torch.sum((module.weight - target) ** 2)
+                for module, z, u in prox_targets:
+                    prox = prox + 0.5 * admm_lambda * torch.sum((module.weight - target(z, u, module.weight)) ** 2)
                 (loss / grad_accum + prox / grad_accum).backward()
         torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if prox_after_clip:
             with torch.no_grad():
-                for module, target in prox_targets:
-                    module.weight.grad.add_(admm_lambda * (module.weight.detach() - target))
+                for module, z, u in prox_targets:
+                    module.weight.grad.add_(admm_lambda * (module.weight.detach() - target(z, u, module.weight)))
         opt.step()
         if scheduler is not None:
             scheduler.step()
@@ -486,6 +562,7 @@ def _compute_hessians(
     damping: float,
     n_samples: int | None = None,
     diag_only: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> list[torch.Tensor]:
     """Damped Hessians for every module in ``modules`` from one calibration pass.
 
@@ -506,7 +583,7 @@ def _compute_hessians(
       2048-token sequences is plenty.
 
     ``diag_only`` returns ``(d_in,)`` diagonals instead of full matrices
-    (see `LayerHessian`).
+    (see `LayerHessian`). ``dtype`` defaults to each module's weight dtype.
     """
     hessians = [LayerHessian(m.weight.shape[1], device, diag_only=diag_only) for m in modules]
     pending: set[int] = set()
@@ -528,13 +605,14 @@ def _compute_hessians(
             pending.update(range(len(modules)))
             batch = ids[i : i + batch_size].to(device)
             try:
-                model(input_ids=batch, use_cache=False)
+                with _student_autocast(device):
+                    model(input_ids=batch, use_cache=False)
             except _StopForward:
                 pass
     finally:
         for h in handles:
             h.remove()
-    return [h.damped(damping=damping, dtype=m.weight.dtype) for m, h in zip(modules, hessians)]
+    return [h.damped(damping=damping, dtype=dtype or m.weight.dtype) for m, h in zip(modules, hessians)]
 
 
 def _compute_hessian(
@@ -656,7 +734,7 @@ def run_phase1(
                 admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
             module.weight.data.copy_(x)
             _x_step(
-                model, teacher, [module], [(module, (z - u))],
+                model, teacher, [module], [(module, z, u)],
                 calib_ids, cfg.x_steps, cfg.micro_batch, cfg.grad_accum,
                 cfg.lr, admm_lambda, cfg.alpha_kd, device,
                 max_grad_norm=cfg.max_grad_norm, opt=opt, kd_temperature=cfg.kd_temperature,
@@ -692,6 +770,210 @@ def run_phase1(
     return states
 
 
+# --------------------------------------------------------------------------
+# Local Phase 1 (`--p1-mode local`): per-layer reconstruction ADMM
+# --------------------------------------------------------------------------
+#
+# `run_phase1` above optimizes each layer against the *full-model* CE+KD loss:
+# every x-step runs the whole student forward/backward plus a teacher forward,
+# 56 of them per layer. That's 72*56 = 4032 full-model steps on OPT-125M and
+# 168*56 = 9408 on HGRN-1.3B -- as much as, or more than, Phase 2's entire
+# 4096-step budget, which is why two-phase has been slower than one-phase
+# (PROGRESS.md Session 12).
+#
+# Local mode instead solves each layer's own reconstruction problem,
+#     min_W  1/2 tr((W - W0) H (W - W0)^T)   s.t. W semi-structured sparse,
+# H = (2/N) X X^T of the layer's inputs (the Hessian this package already
+# measures). That's ||(W - W0) X||^2 / N: keep the layer's output close to the
+# dense layer's on the same inputs. Its x-step has a closed form, so no
+# backprop and no teacher: the only model forward passes are the calibration
+# passes that measure H. ADMM with an increasing penalty (the ALPS recipe),
+# then an exact least-squares refit of the kept weights on the final support.
+
+
+@dataclasses.dataclass
+class LocalPhase1Config:
+    target_sparsity: float = 0.8
+    rounds: int = 50
+    # Penalty rho, relative to mean(diag(H)), grown geometrically from
+    # rho_start to rho_end over `rounds` so x is pulled onto z by the end.
+    rho_start: float = 0.01
+    rho_end: float = 10.0
+    # Least-squares refit of the surviving weights on the final support.
+    refit: bool = True
+    damping: float = 0.01
+    hessian_n_calib: int | None = None
+    # Hand Phase 2 only diag(H) (what the diagonal/magnitude Z-steps read).
+    diag_only_hessian: bool = True
+
+
+def _recon_error(W: torch.Tensor, W0: torch.Tensor, H: torch.Tensor) -> float:
+    """tr((W-W0) H (W-W0)^T) / tr(W0 H W0^T): relative output error on the calibration inputs."""
+    D = W - W0
+    return ((D @ H) * D).sum().item() / max(((W0 @ H) * W0).sum().item(), 1e-12)
+
+
+def _refit_on_support(W0: torch.Tensor, H: torch.Tensor, B: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """Exact per-row least squares on a fixed support.
+
+    Row i keeps coordinates idx[i] (k of them) and solves
+    min_w 1/2 (w - w0)^T H (w - w0) with w zero off the support, i.e.
+    H_SS w_S = (H w0)_S = B[i, S] (B = W0 H, H symmetric). Every row keeps
+    exactly k weights (semi-structured), so rows batch into one (R, k, k)
+    Cholesky solve; chunked to bound the gathered H_SS memory.
+    """
+    d_out, k = idx.shape
+    out = torch.zeros_like(W0)
+    chunk = max(1, int(2**28 // (k * k)))  # ~1GB of float32 H_SS per chunk
+    for i in range(0, d_out, chunk):
+        rows = idx[i : i + chunk]
+        Hss = H[rows[:, :, None], rows[:, None, :]]
+        rhs = B[i : i + chunk].gather(1, rows).unsqueeze(-1)
+        L = torch.linalg.cholesky(Hss)
+        out[i : i + chunk].scatter_(1, rows, torch.cholesky_solve(rhs, L).squeeze(-1))
+    return out
+
+
+@torch.no_grad()
+def _local_admm_layer(
+    W0: torch.Tensor, H: torch.Tensor, k_keep: int, cfg: LocalPhase1Config, zstep_fn,
+) -> tuple[torch.Tensor, dict]:
+    """ADMM on one layer's reconstruction objective; returns (pruned W, stats)."""
+    W0 = W0.float()
+    H = H.float()
+    evals, Q = torch.linalg.eigh(H)  # H + rho I = Q diag(evals + rho) Q^T for every rho
+    evals = evals.clamp_min(0.0)
+    B = W0 @ H
+    scale = torch.diagonal(H).mean().item()
+
+    z0 = zstep_fn(W0, H, k_keep)  # one-shot projection of the dense weights, for comparison
+    z, u = z0.clone(), torch.zeros_like(W0)
+    rho_prev = None
+    for r in range(cfg.rounds):
+        frac = r / max(cfg.rounds - 1, 1)
+        rho = scale * cfg.rho_start * (cfg.rho_end / cfg.rho_start) ** frac
+        if rho_prev is not None:
+            u.mul_(rho_prev / rho)  # scaled dual: keep rho*u fixed when rho changes
+        rho_prev = rho
+        # x-step: argmin 1/2 tr((W-W0)H(W-W0)^T) + rho/2 ||W - (z-u)||^2
+        #       = (W0 H + rho (z - u)) (H + rho I)^-1
+        x = (((B + rho * (z - u)) @ Q) / (evals + rho)) @ Q.t()
+        z = zstep_fn(x + u, H, k_keep)
+        u.add_(x - z)
+
+    stats = {"err_oneshot": _recon_error(z0, W0, H), "err_admm": _recon_error(z, W0, H)}
+    if cfg.refit:
+        idx = z.abs().topk(k_keep, dim=1).indices
+        z = _refit_on_support(W0, H, B, idx)
+        stats["err_refit"] = _recon_error(z, W0, H)
+    return z, stats
+
+
+@torch.no_grad()
+def _shared_input_groups(model: nn.Module, layers: list[PrunableLayer], sample: torch.Tensor) -> list[list[PrunableLayer]]:
+    """Group consecutive layers that read the exact same input tensor (e.g. q/k/v).
+
+    Pruning one member can't change another's input, so a group's Hessians
+    can come from one calibration pass and its layers can be pruned together
+    -- the same result as one-at-a-time, with fewer passes. Detected by input
+    data_ptr on one short forward; every captured input is kept alive until
+    the pass ends so a freed buffer can't be reused at the same address.
+    """
+    seen: dict[int, tuple[int, tuple]] = {}
+    keep_alive = []
+
+    def make_hook(i):
+        def hook(module, inputs):
+            x = inputs[0]
+            keep_alive.append(x)
+            seen[i] = (x.data_ptr(), tuple(x.shape))
+        return hook
+
+    handles = [pl.module.register_forward_pre_hook(make_hook(i)) for i, pl in enumerate(layers)]
+    try:
+        model(input_ids=sample, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
+    keep_alive.clear()
+
+    groups: list[list[PrunableLayer]] = []
+    prev = None
+    for i, pl in enumerate(layers):
+        key = seen.get(i)
+        if groups and key is not None and key == prev:
+            groups[-1].append(pl)
+        else:
+            groups.append([pl])
+        prev = key
+    return groups
+
+
+def run_phase1_local(
+    model: nn.Module,
+    layers: list[PrunableLayer],
+    calib_ids: torch.Tensor,
+    cfg: LocalPhase1Config,
+    device,
+    log_fn=print,
+    zstep_fn=diagonal_project,
+) -> dict[str, LayerState]:
+    """Sequential layer-wise reconstruction pruning, straight to cfg.target_sparsity.
+
+    Layers go in execution order; each group of shared-input layers is
+    measured on the model with every earlier layer already pruned (as in
+    `run_phase1`), then committed to its pruned weights. Biases are left
+    untouched.
+
+    Handoff to Phase 2: x = z (the pruned weights), u = 0, admm_lambda = 0.
+    Phase 2 starts from the actually-pruned model with a fresh dual -- this
+    phase's dual belongs to a different objective (reconstruction error, not
+    CE+KD) and a different penalty scale, so there is nothing meaningful to
+    carry or rescale.
+    """
+    import time
+
+    t_start = time.time()
+    groups = _shared_input_groups(model, layers, calib_ids[:1, :128].to(device))
+    log_fn(f"[phase1-local] {len(layers)} layers in {len(groups)} shared-input groups")
+    states: dict[str, LayerState] = {}
+    done = 0
+    for group in groups:
+        t0 = time.time()
+        Hs = _compute_hessians(
+            model, [pl.module for pl in group], calib_ids, device, cfg.damping,
+            n_samples=cfg.hessian_n_calib, diag_only=False, dtype=torch.float32,  # eigh/Cholesky need more than bf16
+        )
+        t_h = time.time() - t0
+        for pl, H in zip(group, Hs):
+            t1 = time.time()
+            module = pl.module
+            n_out, n_in = module.weight.shape
+            x0 = module.weight.data.clone()
+            k_keep = _k_keep(n_in, cfg.target_sparsity)
+            z, stats = _local_admm_layer(x0, H, k_keep, cfg, zstep_fn)
+            z = z.to(x0.dtype)
+            module.weight.data.copy_(z)
+            done += 1
+            H_keep = (torch.diagonal(H).clone() if cfg.diag_only_hessian else H).to(x0.dtype)
+            # Handoff tensors live on CPU (the live module already holds z on the
+            # GPU; run_phase2 moves what it needs back). x and z are the same tensor.
+            z_cpu = z.cpu()
+            states[pl.name] = LayerState(
+                name=pl.name, module=module, x=z_cpu, z=z_cpu, u=torch.zeros_like(z_cpu), H=H_keep.cpu(),
+                n_in=n_in, n_out=n_out, x0_norm=x0.norm().item(),
+                final_sparsity=(z == 0).float().mean().item(), admm_lambda=0.0,
+            )
+            errs = " ".join(f"{k}={v:.4f}" for k, v in stats.items())
+            log_fn(
+                f"[phase1-local] layer {done}/{len(layers)} {pl.name}: {errs} "
+                f"sparsity={states[pl.name].final_sparsity:.3f} (hessian {t_h:.1f}s, solve {time.time()-t1:.1f}s)"
+            )
+        del Hs
+    log_fn(f"[phase1-local] done in {time.time()-t_start:.1f}s")
+    return states
+
+
 def run_phase2(
     model: nn.Module,
     teacher: nn.Module,
@@ -718,62 +1000,125 @@ def run_phase2(
     if cfg.dual_init not in ("carry", "rescale", "zero"):
         raise ValueError(f"unknown dual_init {cfg.dual_init!r}")
     for name, s in phase1_states.items():
-        x = s.x.clone()
-        z = s.z.clone()
-        u = s.u.clone()
+        sd = cfg.state_dtype or s.module.weight.dtype
+        z = s.z.to(device=device, dtype=sd, copy=True)
+        u = s.u.to(device=device, dtype=sd, copy=True)
         if cfg.dual_init == "zero":
             u.zero_()
         elif cfg.dual_init == "rescale" and s.admm_lambda > 0:
             u.mul_(s.admm_lambda / cfg.admm_lambda_max)
-        s.module.weight.data.copy_(x)
+        s.module.weight.data.copy_(s.x)
         # Phase 1 (or build_dense_states) offloaded each H to CPU once it
         # was done with it; Phase 2 needs every layer's H simultaneously
         # and repeatedly (every round's Z-step), so bring them all back
-        # now, once, rather than per-round.
+        # now, once, rather than per-round. x isn't kept here: the live
+        # module weight *is* x for the whole run.
         working[name] = LayerState(
-            name=name, module=s.module, x=x, z=z, u=u, H=s.H.to(device),
+            name=name, module=s.module, x=None, z=z, u=u, H=s.H.to(device),
             n_in=s.n_in, n_out=s.n_out, x0_norm=s.x0_norm,
         )
         modules.append(s.module)
 
     _set_trainable(modules, True)
     k_keep = {name: _k_keep(s.n_in, cfg.target_sparsity) for name, s in working.items()}
+    if cfg.hessian_refresh and any(s.H.dim() != 1 for s in working.values()):
+        raise ValueError("hessian_refresh only re-measures diag(H); use it with --zstep diagonal (diag-only Hessians)")
+
+    extra_params: list[torch.nn.Parameter] = []
+    if cfg.train_extra:
+        owned = {id(p) for m in modules for p in m.parameters()}
+        extra_params = [p for p in model.parameters() if id(p) not in owned]
+        for p in extra_params:
+            p.requires_grad_(True)
+        log_fn(f"[phase2] also training {len(extra_params)} non-pruned tensors "
+               f"({sum(p.numel() for p in extra_params)/1e6:.1f}M params: norms, embeddings, lm_head, ...)")
+
+    # Hessian refresh: accumulate sum(x^2) per input column of every prunable
+    # layer over the x-step's student forwards. With gradient checkpointing
+    # the recompute pass fires the hook again; sum and count both double, so
+    # the average is unchanged.
+    hooks = []
+    if cfg.hessian_refresh:
+        acc = {name: [torch.zeros(s.n_in, device=device, dtype=torch.float32), 0] for name, s in working.items()}
+
+        def make_hook(name):
+            def hook(module, inputs):
+                if not module.training:
+                    return
+                with torch.no_grad():
+                    a = inputs[0].detach().reshape(-1, inputs[0].shape[-1])
+                    acc[name][0].add_(a.float().pow(2).sum(dim=0))
+                    acc[name][1] += a.shape[0]
+            return hook
+
+        hooks = [s.module.register_forward_pre_hook(make_hook(name)) for name, s in working.items()]
 
     # One optimizer for the whole Phase 2 run (real ELSA's continuous-training
     # design: persistent Adam state, dual updates only every `rounds`-th
     # boundary -- not a fresh Adam restarted at every round, which was
     # forcing repeated momentum re-warm-up and was diagnosed as a real
     # contributor to divergence this session).
-    opt = _build_optimizer(modules, cfg.lr, betas=(cfg.beta1, cfg.beta2))
+    opt = _build_optimizer(modules, cfg.lr, betas=(cfg.beta1, cfg.beta2), extra_params=extra_params)
     total_steps = cfg.rounds * cfg.x_steps
     scheduler = _build_linear_decay_scheduler(opt, total_steps=total_steps)
+    sampler = EpochSampler(calib_ids, seed=cfg.seed) if cfg.epoch_sampling else None
 
-    for r in range(cfg.rounds):
-        if cfg.lambda_schedule == "constant":
-            admm_lambda = cfg.admm_lambda_max
-        else:
-            admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
-        prox_targets = [(s.module, (s.z - s.u)) for s in working.values()]
-        _x_step(
-            model, teacher, modules, prox_targets, calib_ids,
-            cfg.x_steps, cfg.micro_batch, cfg.grad_accum, cfg.lr,
-            admm_lambda, cfg.alpha_kd, device,
-            max_grad_norm=cfg.max_grad_norm, opt=opt, scheduler=scheduler, kd_temperature=cfg.kd_temperature,
-            betas=(cfg.beta1, cfg.beta2), prox_after_clip=cfg.prox_after_clip,
-        )
+    try:
+        for r in range(cfg.rounds):
+            if cfg.lambda_schedule == "constant":
+                admm_lambda = cfg.admm_lambda_max
+            else:
+                admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
+            prox_targets = [(s.module, s.z, s.u) for s in working.values()]
+            _x_step(
+                model, teacher, modules, prox_targets, calib_ids,
+                cfg.x_steps, cfg.micro_batch, cfg.grad_accum, cfg.lr,
+                admm_lambda, cfg.alpha_kd, device,
+                max_grad_norm=cfg.max_grad_norm, opt=opt, scheduler=scheduler, kd_temperature=cfg.kd_temperature,
+                betas=(cfg.beta1, cfg.beta2), prox_after_clip=cfg.prox_after_clip,
+                extra_params=extra_params, sampler=sampler,
+            )
 
-        max_ratio = 0.0
-        for name, s in working.items():
-            s.x = s.module.weight.data.clone()
-            v = s.x + s.u
-            s.z = zstep_fn(v, s.H, k_keep[name])
-            s.u = s.u + s.x - s.z
-            s.module.weight.data.copy_(s.x)  # keep dense x live until the final commit
-            max_ratio = max(max_ratio, s.u.norm().item() / max(s.x0_norm, 1e-12))
-        log_fn(f"[phase2] round {r+1}/{cfg.rounds} target_sparsity={cfg.target_sparsity:.2f} max ||u||/||x0||={max_ratio:.4f}")
+            last = r == cfg.rounds - 1
+            max_ratio, res_sq, x_sq, h_drift = 0.0, 0.0, 0.0, 0.0
+            for name, s in working.items():
+                if cfg.hessian_refresh and acc[name][1] > 0:
+                    h = acc[name][0] * (2.0 / acc[name][1])
+                    h[h == 0] = 1.0
+                    h += cfg.damping * h.mean()
+                    old = s.H.float()
+                    h_drift = max(h_drift, ((h / h.mean()) - (old / old.mean())).abs().mean().item())
+                    s.H = h.to(s.H.dtype)
+                    acc[name][0].zero_()
+                    acc[name][1] = 0
+                x = s.module.weight.data.float()
+                u = s.u.float()
+                z = zstep_fn(x + u, s.H, k_keep[name])
+                u = u + x - z
+                res_sq += (x - z).pow(2).sum().item()
+                x_sq += x.pow(2).sum().item()
+                s.z, s.u = z.to(s.z.dtype), u.to(s.u.dtype)
+                if last:
+                    # Final commit straight from the float32 projection (not
+                    # the possibly-bf16 stored z).
+                    s.module.weight.data.copy_(z)
+                max_ratio = max(max_ratio, u.norm().item() / max(s.x0_norm, 1e-12))
+                del x, u, z
+            msg = (f"[phase2] round {r+1}/{cfg.rounds} target_sparsity={cfg.target_sparsity:.2f} "
+                   f"max ||u||/||x0||={max_ratio:.4f} ||x-z||/||x||={math.sqrt(res_sq / max(x_sq, 1e-30)):.4f}")
+            if cfg.hessian_refresh:
+                msg += f" diagH_drift={h_drift:.4f}"
+            log_fn(msg)
+    finally:
+        for h in hooks:
+            h.remove()
 
     for name, s in working.items():
-        s.module.weight.data.copy_(s.z)
-        s.final_sparsity = (s.z == 0).float().mean().item()
+        s.final_sparsity = (s.module.weight.data == 0).float().mean().item()
     _set_trainable(modules, False)
+    for p in extra_params:
+        p.requires_grad_(False)
+    # Free gradients (and with them ~5GB at fp32 on HGRN) before evaluation.
+    for p in model.parameters():
+        p.grad = None
     return working

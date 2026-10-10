@@ -87,7 +87,7 @@ def run_phase2_relaxed(
             admm_lambda = cfg.admm_lambda_max
         else:
             admm_lambda = _cosine_lambda_ramp((r + 1) * cfg.x_steps, total_steps, cfg.admm_lambda_max)
-        prox_targets = [(s.module, (s.z - s.u)) for s in working.values()]
+        prox_targets = [(s.module, s.z, s.u) for s in working.values()]
         _x_step(
             model, teacher, modules, prox_targets, calib_ids,
             cfg.x_steps, cfg.micro_batch, cfg.grad_accum, cfg.lr,
