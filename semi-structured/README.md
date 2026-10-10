@@ -61,29 +61,6 @@ training forward passes (`--p2-hessian-refresh`).
 
 ## Measured result
 
-`facebook/opt-125m`, 50% sparsity, default settings:
-
-| | WikiText2 PPL | C4 PPL |
-|---|---|---|
-| Dense | 27.66 | 25.17 |
-| **This method (50% sparsity)** | **78.10** | **51.02** |
-
-Zero-shot accuracy (7-task average, lm-evaluation-harness): dense 0.377,
-pruned 0.385 -- essentially unchanged, within the noise of a 7-task
-average this small.
-
-Reproduce with:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-python run_pipeline.py --model facebook/opt-125m --sparsities 0.5 --out results/opt-125m
-```
-
-A single A100-40GB run takes on the order of a few hours for OPT-125M
-(most of it in Phase 2's 4096 optimizer steps).
-
 `fla-hub/hgrn-1.3B-100B`, 80% sparsity. Perplexity uses ELSA-official's
 own evaluation protocol (its WikiText-2 / C4 test sets and formula, fp16),
 so every row is directly comparable. All rows are single runs.
@@ -120,7 +97,12 @@ See `ehws/hparams.py`'s module docstring.
 
 ## Running HGRN-1.3B (80% sparsity)
 
-Assumes the venv from the OPT-125M quickstart above is already set up.
+Set up the environment once:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 **Two-phase with local Phase 1 (46.49 / 34.58 above).** The training
 data is ELSA's own tokenized cache. Build it once by running ELSA-official
