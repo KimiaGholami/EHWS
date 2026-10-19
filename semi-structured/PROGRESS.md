@@ -1,6 +1,6 @@
 # Progress log
 
-**Read this file first in any new session.** It is written to be
+**Read this file first in any new session.** For the current numbers, jump to **"Results summary"** near the end of the file. It is written to be
 self-contained: everything needed to continue this work from a fresh
 session should be here.
 
@@ -1768,3 +1768,237 @@ Job 21177562 started 2026-10-08 22:19 on g003. The watcher launched `launch.sh` 
   - The one-phase baseline hasn't been rerun with the same fixes, so "two-phase beats one-phase" is not shown yet.
 - **Weights:** `ehws-exp-out/s16-hgrn/local-fp32-elsadata-extra-hrefresh/model-s0.8/` (fp32, 5.5 GB, not uploaded).
 - **Bug fixed after the run:** `launch.sh`'s memory gate compared MiB as strings (it reported 9,465 vs a true 36,141 MiB peak). It now compares numerically. The run itself was unaffected: the true peak was under 39.5 GB.
+
+## Session 17 (2026-10-10): OPT-125M @80% with the Session 16 changes
+
+`results/_s17_opt125m/launch.sh`, job 21177562 on g003. The run was the Session 12/13 local r128 config (auto hparams lr 6e-4 / lambda 1e-3 constant, beta2 0.999, fp32, H 256) plus `--elsa-train-cache` (ELSA's OPT cache) `--p2-epoch-sampling --p2-train-extra --p2-hessian-refresh`. Item 1 doesn't apply: OPT-125M always trained in full fp32. Phase 1 took 272s and Phase 2 5,925s (partly sharing the GPU). An ELSA-official unstructured run was started alongside it and then stopped at the user's request; the paper number is used instead.
+
+| OPT-125M @80% (ELSA protocol) | WT2 | C4 |
+|---|---|---|
+| ELSA paper, unstructured | 65.30* | 47.74* |
+| ELSA official code, row-wise | 75.86 | 53.45 |
+| **EHWS local two-phase + ELSA data / extras / H refresh (s17)** | **82.31** | **55.69** |
+| EHWS local two-phase r128 rerun (s13) | 80.26 | 58.11 |
+| EHWS one-phase r128 rerun (s13) | 84.18 | 55.87 |
+
+\* paper eval; the paper's dense row is ~0.15% off ELSA's code.
+
+- Against the earlier local run: C4 -4.2%, which is real because C4 reproduces within 0.5%. WT2 +2.6%, inside WT2's ~5% run-to-run noise.
+- Against ELSA row-wise it is still worse: +8.5% WT2 / +4.2% C4. The HGRN-sized gain (-35% / -25%) did **not** transfer.
+- The fp32 fix was HGRN-only, and it is the likeliest single source of HGRN's jump.
+- The end-of-run residual is high: `||x-z||/||x||` was 0.040 at round 128 vs 0.0022 on HGRN, and `max ||u||/||x0||` was 0.63. The final projection may cost noticeably here. Untested.
+- Weights: `ehws-exp-out/s17-opt125m/ehws/model-s0.8`.
+
+### Session 17 continued (2026-10-10): why the HGRN gains didn't transfer to OPT-125M
+
+All PPL under the ELSA protocol.
+
+**Evidence (Phase 2 logs, rounds 1 -> 128):**
+
+| | HGRN-1.3B (s16) | OPT-125M (s17) |
+|---|---|---|
+| max `||u||/||x0||` | 0.02 throughout | 0.23 -> 0.93 -> 0.58 |
+| `||x-z||/||x||` | 0.011 -> 0.0022 | 0.062 -> 0.073 -> 0.040 |
+| `diagH_drift` per refresh | 0.22-0.27 | 0.55-0.95 |
+
+- ELSA logs the same residual (`eval_relative_residual`, defined as `||w-z||/||w||` over the ADMM weights; checked in `lib/trainer.py`). Its OPT-125M row-wise run ends at 0.065, and projecting costs 0.055 nats (eval loss 3.836 -> 3.891). EHWS ends *closer* to feasible (0.040), so **the final projection is not the OPT gap.**
+- One-phase EHWS also trails ELSA row-wise on OPT-125M (84.18 / 55.87 vs 75.86 / 53.45) while matching it on HGRN. So part of the OPT gap sits in Phase 2 itself, not only the handoff.
+
+**Explanation (the first and third points are hypotheses; nothing ablated yet):**
+1. The fp32-master fix was HGRN-only; OPT-125M always trained in fp32. It is probably the bulk of HGRN's gain.
+2. The regimes differ.
+   - On HGRN, local Phase 1 hands over a good model. Phase 2 is near-fixed-mask fine-tuning (tiny dual, ~1% residual), where more data and extra parameters help directly.
+   - On OPT-125M, local Phase 1 alone scores 681 / 338 (Session 12). Phase 2 has to rearrange the mask (large dual), and lambda is 10x smaller (1e-3 vs 1e-2, each ELSA's own per-model value).
+3. Hessian selection is unstable on OPT. OPT-125M has a few huge-activation input channels, and training its LayerNorms/embeddings moves them. diag(H) therefore drifts 2-4x more per refresh than on HGRN, and the mask chases a moving target.
+
+**Ranked ideas for OPT-125M two-phase (local Phase 1) @80%:**
+1. Steadier Hessian selection: EMA refresh or no refresh, and a tempered score `H_ii^0.5 * v^2`.
+2. A less damaged handoff: local Phase 1 to 0.6/0.7, with Phase 2 taking it to 0.8.
+3. A stronger penalty from the pruned start: lambda 3e-3 / 1e-2.
+4. LayerNorms-only extras (don't train the tied embedding/lm_head at 6e-4).
+5. A better local Phase 1: full Hessian, error-correcting targets.
+6. Non-uniform per-layer allocation.
+- beta2 0.95 is already closed out on OPT-125M (Session 5: 93.22 / 54.90, worse).
+
+### Session 17 housekeeping (2026-10-10)
+
+- **OPT-1.3B:** briefly set up (ELSA vs EHWS), then cancelled by the user (it was meant to be OPT-125M); nothing ran.
+  - Kept from it: `ehws/hparams.py`'s OPT-1.3B @80-90% lambda corrected from 5e-5 to **1e-4** (ELSA Table 5: 5e-5 spans 50-70%; 80-90% is 1e-4).
+  - Also verified that OPT-125M and OPT-1.3B share one tokenizer (fast and slow), so ELSA's OPT-125M training cache serves OPT-1.3B too. The leftovers are `ELSA-official/dataset/facebook_opt-1.3b -> facebook_opt-125m` and `ehws-calib-cache/facebook_opt-1.3b_*` (copies of the 125M eval caches).
+- **ELSA unstructured on OPT-125M:** started alongside the s17 EHWS run and stopped at the user's request; the paper's 65.30 / 47.74 is used. Its first attempt also showed that ELSA's default `--admm_eval_steps=1` (a validation pass after every step) roughly doubles its runtime. Use `--admm_eval_steps` >= 4096 when a run must fit a walltime; it doesn't affect training.
+- **GitHub** (`KimiaGholami/EHWS`, `main`):
+  - `95aecf6`: Sessions 12-16 code and results (local Phase 1, ELSA-protocol eval, `eval_external.py`, the four Phase 2 options, `anvil/` helpers, `results/_s16_hgrn`).
+  - `0f49e47`: the hparams fix and the s17 launch script.
+  - `0d30e8f`, `7ad5278`: README.
+  - The README now leads with HGRN two-phase local 46.49 / 34.58 vs ELSA row-wise / unstructured, gives the exact command for it, and describes local Phase 1. The removed parts are the obsolete OPT-125M 50% table (78.10 / 51.02), the "ladder" Phase 1 text and its "Known limitation" section. The semi-structured definition was corrected to per-row (the code was always per-row).
+  - Pushed with a user-supplied token via a temporary askpass (never stored). The user was asked to revoke it.
+- **Hugging Face:** `ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct` now holds the s16 weights.
+  - Commit `ca8071b`, fp32; `config.json` dtype was corrected from bfloat16 to float32. The SHA-256 of `model.safetensors` matches the local file.
+  - The model card was rewritten.
+  - The previous Session 14 weights are tagged `s14-bf16`.
+  - Uploaded with a user-supplied token via stdin (never stored). The user was asked to revoke it.
+
+## Session 18 (2026-10-10): separate OPT-125M code directory; lambda sweep queued
+
+**User's instruction:** OPT-125M experiments must not change the main code. They live in **`EHWS/opt125m/`**, a copy of `semi-structured/{ehws/, run_pipeline.py, eval_external.py, requirements.txt}` as of the Session 17 state. Its own `results/` holds the launch scripts.
+
+**OPT-only options in `opt125m/` (all default off; with defaults the copy is identical in behavior to `semi-structured/`):**
+- `--zstep-hessian-power G`: the Phase 2 Z-step scores `H_ii**G * v**2`. G=1 is the current score; 0.5 tempers outlier channels; 0 is magnitude. Phase 1 is unchanged.
+- `--p2-hessian-ema B`: with `--p2-hessian-refresh`, `H <- B*H + (1-B)*H_window` instead of replacing it.
+- `--p2-train-extra-scope {all,norms}`: with `--p2-train-extra`, train every non-pruned parameter, or LayerNorms only.
+- Checked on the login node:
+  - G=1 matches the existing score exactly; G=0.5 changes the mask and keeps k per row.
+  - `all` selects the same 52 tensors (40.2M params) as s17.
+  - `norms` selects the 50 LayerNorm tensors (0.04M).
+
+**Queued: lambda sweep** (`opt125m/results/_s18_opt125m_lambda/`):
+- The config is identical to s17 (82.31 / 55.69 at lambda 1e-3) except `--p2-lambda-max 3e-3` and `1e-2` (constant).
+- Both arms share GPU 0 if the job has 1 GPU (~14-19 GB each), or take one GPU each.
+- `wait_and_launch.sh` runs detached on **login06** and waits for OnDemand job **21236984** (pending, 1 GPU, 48h). When the job starts, it SSHes to the node and runs `launch.sh`.
+- `launch.sh` also runs a watchdog that logs every 2 min and writes warnings and errors to `status.txt`.
+- Outputs go to `/anvil/scratch/x-kgholami/ehws-exp-out/s18-opt125m-lambda/{lam3e-3,lam1e-2}`.
+- Expected time: ~2-2.5h with both arms on one GPU.
+- If the watcher dies, run `bash opt125m/results/_s18_opt125m_lambda/launch.sh` by hand inside the session.
+
+**Next after the lambda sweep (user to choose):** EMA vs no refresh, the tempered score (G=0.5), LayerNorms-only extras, and local Phase 1 target 0.7 / 0.6. All are ready to run from `opt125m/`.
+
+### Session 18 result (2026-10-11 23:11): lambda 3e-3 puts OPT-125M two-phase ahead of ELSA row-wise
+
+Job 21236984 started 2026-10-11 19:41 on g011. The watcher launched both arms at 19:43, sharing one GPU (27.7 GB). Both finished at 23:10-23:11, exit 0, with no watchdog warnings.
+
+| OPT-125M @80% (ELSA protocol) | WT2 | C4 | end `||x-z||/||x||` | end max `||u||/||x0||` |
+|---|---|---|---|---|
+| ELSA paper, unstructured | 65.30* | 47.74* | | |
+| **EHWS local two-phase, lambda 3e-3 (s18)** | **73.85** | **52.52** | 0.018 | 0.30 |
+| ELSA official code, row-wise | 75.86 | 53.45 | 0.065 | |
+| EHWS local two-phase, lambda 1e-2 (s18) | 77.91 | 54.46 | 0.007 | 0.15 |
+| EHWS local two-phase, lambda 1e-3 (s17) | 82.31 | 55.69 | 0.040 | 0.58 |
+
+\* paper eval.
+
+- **lambda 3e-3 is the best OPT-125M result so far.** It beats ELSA row-wise (same constraint) by -2.6% WT2 / -1.7% C4, and lambda 1e-3 by -10% / -6%. It is single seed. C4 reproduces within ~0.5%, so the C4 margin over ELSA is probably real; the WT2 margin is inside WT2's ~5% noise.
+- **lambda 1e-2 overshoots.** It is better than 1e-3 but worse than 3e-3, consistent with an interior optimum near 3e-3. The pull toward feasibility helps until it freezes the mask too early.
+- diag(H) drift stayed high in both arms (0.47-0.88), so the Hessian-stability options are still untested levers.
+- Weights: `ehws-exp-out/s18-opt125m-lambda/{lam3e-3,lam1e-2}/model-s0.8`.
+
+**Fix (2026-10-12): `results.json` now records the Phase 2 hparams actually used.** With auto-hparams on, the `config` block's `p2_lr` / `p2_lambda_max` / `p2_lambda_schedule` are ignored CLI defaults. For example, the s17 OPT run's config said `p2_lambda_max: 5e-05`, but its log shows it used lambda 1e-3. Each sparsity entry now carries `p2_hparams: {lr, lambda, schedule, source}`. Applied to both `semi-structured/run_pipeline.py` and `opt125m/run_pipeline.py`. Backfilled into s17's `results.json` from its log (original kept as `results.json.orig`). Older auto-hparams runs (s12/s13 OPT) were not backfilled: trust their `run.log` "auto hparams" line, not `config`.
+
+## Results summary (as of 2026-10-19): every 80% result under the ELSA protocol
+
+Single seed unless noted. "Row-wise" = same nonzeros per row (our constraint). All EHWS rows are row-wise. WT2 moves up to ~5% between identical runs; C4 moves under ~0.5%.
+
+**HGRN-1.3B @80%** (dense 11.81 / 16.09)
+
+| Run | WT2 | C4 | Session |
+|---|---|---|---|
+| **EHWS two-phase, local (ALPS) Phase 1 + fp32 master + ELSA data + extras + H refresh** | **46.49** | **34.58** | 16 (on HF) |
+| ELSA official, unstructured | 54.08 | 36.92 | Aug 31 run |
+| EHWS one-phase (bf16, 2,048 seqs) | 56.57 | 40.44 | 8 |
+| ELSA official, row-wise | 58.79 | 40.30 | 15 |
+| EHWS two-phase, local Phase 1 (bf16, 2,048 seqs) | 71.41 | 45.87 | 14 (HF tag `s14-bf16`) |
+| EHWS two-phase, global Phase 1, Phase 1 lambda = Phase 2's (const) | 76.27 | 48.64 | 15 |
+| EHWS two-phase, global Phase 1, carry dual, full H | 87.73 | 55.46 | 7 |
+| EHWS two-phase, global Phase 1, carry dual, H 256 | 90.63 | 55.72 | 15 |
+| EHWS two-phase, global Phase 1, `rescale` dual, H 256 | 102.88 | 61.02 | 14 |
+
+**OPT-125M @80%** (dense 27.61 / 26.52)
+
+| Run | WT2 | C4 | Session |
+|---|---|---|---|
+| ELSA paper, unstructured (paper eval) | 65.30 | 47.74 | paper |
+| **EHWS two-phase, local Phase 1 + ELSA data + extras + H refresh, lambda 3e-3, lr 4e-4** | **66.65** | **49.45** | 19 (on HF) |
+| EHWS same, LayerNorms-only extras (lr 6e-4) | 68.16 | 51.74 | 19 |
+| EHWS same, local Phase 1 to 0.7 (lr 6e-4) | 71.93 | 50.48 | 19 |
+| EHWS same, lambda 3e-3, lr 6e-4 | 73.85 | 52.52 | 18 |
+| ELSA official, row-wise | 75.86 | 53.45 | 13 |
+| EHWS same, lambda 1e-2 | 77.91 | 54.46 | 18 |
+| EHWS two-phase, global Phase 1, `rescale` dual, r128 | 80.45 | 56.97 | 13 |
+| EHWS two-phase, local Phase 1, r128 (2,048 seqs, lambda 1e-3) | 80.26 | 58.11 | 13 |
+| EHWS same + ELSA data + extras + H refresh, lambda 1e-3 | 82.31 | 55.69 | 17 |
+| EHWS one-phase, r128 | 84.18 | 55.87 | 13 |
+| EHWS one-phase, r64 | 89.33 | 60.03 | 13 |
+| EHWS two-phase, local Phase 1, r64 | 89.84 | 62.54 | 13 |
+| EHWS two-phase, local Phase 1, r32 | 102.80 | 71.00 | 14 |
+
+**Where things stand:** on both models, the local (ALPS) two-phase EHWS beats ELSA official under the same row-wise constraint: by 21% / 14% on HGRN and by 12% / 7.5% on OPT-125M. On HGRN it also beats ELSA unstructured. On OPT-125M, ELSA's unstructured paper number is still ahead by 2.1% / 3.6%. Both best runs are single seed. Batch A was on OPT only; its findings (lower lr, LayerNorms-only extras, Phase 1 to 0.7) haven't been tried on HGRN.
+
+## OPT-125M test plan (2026-10-12; not started, user to choose)
+
+Base config = Session 18's lambda 3e-3 run (73.85 / 52.52). Everything runs from `opt125m/`. Decide on C4.
+
+**Batch A (flags only, no code):**
+1. Seeds 1 and 2 at lambda 3e-3: is the lead over ELSA row-wise (-1.7% C4) real?
+2. lambda 2e-3 and 5e-3: locate the optimum (1e-3 < 3e-3 > 1e-2).
+3. Penalty ramp `--p2-lambda-schedule cosine` to 1e-2 (0 -> 1e-2): weak early (masks can move), strong late (feasible). ELSA uses cosine for its larger models.
+4. `--p2-hessian-ema 0.9`, and no `--p2-hessian-refresh`: diag(H) drift is 0.5-0.9 per refresh on OPT vs 0.2 on HGRN.
+5. `--zstep-hessian-power 0.5`: temper OPT's huge-activation channels in the score.
+6. `--p2-train-extra-scope norms`: stop training the tied embedding/lm_head at 3x ELSA's lr.
+7. `--p1-target-sparsity 0.7`: hand Phase 2 a less damaged model (local Phase 1 alone at 80% = 681 / 338).
+8. Phase 2 lr 4e-4 and 9e-4: 6e-4 was tuned at lambda 1e-3, before the data/extras changes.
+
+**Batch B (needs code in `opt125m/`):**
+- `alpha_kd` 0.3 / 0.7 (flag exists)
+- hidden-state KD
+- full-Hessian, error-correcting local Phase 1
+- non-uniform per-layer sparsity from Phase 1's reconstruction errors (rows stay uniform within each layer)
+- freezing the mask for the last rounds
+
+## Session 19 (2026-10-12): OPT-125M batch A launched (10 arms)
+
+- **User decision:** no seed runs. The lambda 3e-3 result (73.85 / 52.52) is taken as better than ELSA row-wise (75.86 / 53.45) without seed confirmation. It is single seed; the C4 margin is 1.7% and C4 reproduces within ~0.5%.
+- **Setup:** `opt125m/results/_s19_opt125m_batchA/launch.sh`, started 2026-10-12 14:39 on g011 (job 21236984, 29h walltime left).
+  - Base = s18 lambda 3e-3. Each arm changes one thing.
+  - Two lanes share GPU 0 (two runs at a time, ~3.5h per pair, ~17.5h total).
+  - A lane only starts an arm if at least 4h of walltime remain; otherwise it logs SKIP.
+  - The watchdog writes to `status.txt`.
+  - Outputs: `/anvil/scratch/x-kgholami/ehws-exp-out/s19-opt125m-batchA/<arm>/`.
+
+| Lane 1 | Lane 2 |
+|---|---|
+| `lam2e-3` (lambda 2e-3) | `lam5e-3` (lambda 5e-3) |
+| `lamcos1e-2` (cosine 0 -> 1e-2) | `hema0.9` (`--p2-hessian-ema 0.9`) |
+| `norefresh` (no H refresh) | `hpow0.5` (`--zstep-hessian-power 0.5`) |
+| `extras-norms` (LayerNorms only) | `p1t0.7` (local Phase 1 to 0.7) |
+| `lr4e-4` | `lr9e-4` |
+
+**Batch A pair 1 (finished 2026-10-12 18:05-18:08):** lambda 2e-3 scored 75.70 / 53.58 and lambda 5e-3 scored 75.75 / 53.90. Both are worse than 3e-3 (73.85 / 52.52) by ~2% C4. Together with 1e-3 (82.31 / 55.69) and 1e-2 (77.91 / 54.46), **lambda 3e-3 is the optimum of the constant schedule**; the curve is fairly flat between 2e-3 and 5e-3.
+
+### Session 19 result (batch A finished 2026-10-13 07:47): lr 4e-4 is the best OPT-125M result of the project
+
+All 10 arms exited 0 with no watchdog warnings. Zero-shot was skipped (`--skip-zeroshot`) in every arm. Every arm saved its weights to `/anvil/scratch/x-kgholami/ehws-exp-out/s19-opt125m-batchA/<arm>/model-s0.8`.
+
+| OPT-125M @80% (ELSA protocol), one change vs base | WT2 | C4 | C4 vs base |
+|---|---|---|---|
+| ELSA paper, unstructured | 65.30* | 47.74* | |
+| **`lr4e-4`: Phase 2 lr 4e-4** | **66.65** | **49.45** | **-5.8%** |
+| `p1t0.7`: local Phase 1 to 0.7, Phase 2 to 0.8 | 71.93 | 50.48 | -3.9% |
+| `hema0.9`: `--p2-hessian-ema 0.9` | 71.89 | 51.67 | -1.6% |
+| `extras-norms`: train LayerNorms only | 68.16 | 51.74 | -1.5% |
+| `norefresh`: no diag(H) refresh | 72.33 | 52.06 | -0.9% |
+| `hpow0.5`: Z-step score `H_ii^0.5 * v^2` | 73.39 | 52.18 | -0.6% (noise) |
+| Base (s18 lambda 3e-3, lr 6e-4) | 73.85 | 52.52 | |
+| `lam2e-3` | 75.70 | 53.58 | +2.0% |
+| `lam5e-3` | 75.75 | 53.90 | +2.6% |
+| ELSA official code, row-wise | 75.86 | 53.45 | |
+| `lamcos1e-2`: cosine 0 -> 1e-2 | 94.40 | 63.56 | +21% |
+| `lr9e-4` | 145.67 | 85.60 | +63% |
+
+\* paper eval.
+
+- **lr is the strongest lever, and lower is better.** lr 4e-4 beats ELSA row-wise (same constraint) by -12% WT2 / -7.5% C4, and comes within +2.1% / +3.6% of ELSA's *unstructured* paper number. lr 9e-4 diverges. 6e-4 was tuned at lambda 1e-3, before ELSA data / extras / H refresh were added, and the optimum has moved down. ELSA's own OPT-125M lr is 2e-4, untested here.
+- **The lr and LayerNorms-only gains probably overlap.** Both reduce the step size on the tied embedding / `lm_head`, which `--p2-train-extra` trains at the full Phase 2 lr. Not separated yet.
+- **A less-damaged handoff helps** (`p1t0.7`, -3.9% C4). This is the second-largest single gain.
+- **Steadier Hessian selection helps a little** (EMA -1.6%, no refresh -0.9%). Tempering the score (H^0.5) is within noise.
+- **The cosine lambda ramp is clearly harmful** (+21% C4). Weak early pressure lets the mask drift too far; ELSA's cosine default for larger models does not transfer to this pruned-start regime. Closed out.
+- `lr4e-4` Phase 2 end state: `||x-z||/||x||` 0.015, `max ||u||/||x0||` 0.26 (s18 base: 0.018 / 0.30).
+- Single seed. Gains under ~1% C4 are within noise.
+- **The best weights (`lr4e-4`) were uploaded to HF** as `ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct` (2026-10-19).
+
+**Next (Batch C, flags only, from `opt125m/`):**
+1. lr 2e-4 and 3e-4: the trend hasn't turned yet, and 2e-4 is ELSA's value.
+2. Stack the winners on the best lr: `p1t0.7` + `hema0.9`, then add `extras-norms` as a separate arm (likely overlaps with the lr gain).
+3. Re-check lambda (2e-3 / 5e-3) at the new lr.
+4. `--p1-target-sparsity 0.6` if 0.7 stacks.
+5. Zero-shot for the best arm (rerun eval on the saved weights).
+
+**HGRN-1.3B follow-ups suggested by batch A** (not run): Phase 2 lr 2e-4 / 4e-4 (HGRN still uses 6e-4, tuned in the bf16 / 2,048-sequence era), LayerNorms-only extras, local Phase 1 to 0.7, an ablation of Session 16's four changes, and one-phase rerun with the same four changes.

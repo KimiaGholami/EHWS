@@ -552,6 +552,10 @@ def main():
         entry = {
             "target_sparsity": sparsity,
             "achieved_sparsity": achieved / total,
+            # What Phase 2 actually used. With auto-hparams on, config's --p2-lr /
+            # --p2-lambda-max / --p2-lambda-schedule are ignored defaults.
+            "p2_hparams": {"lr": lr, "lambda": lam, "schedule": schedule,
+                           "source": "manual" if args.no_auto_hparams else "auto (ehws/hparams.py)"},
             "wikitext2_ppl": compute_perplexity(model, wt2_ids, device),
             "c4_ppl": compute_perplexity(model, c4_eval_ids, device),
         }

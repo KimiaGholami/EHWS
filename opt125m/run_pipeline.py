@@ -1,0 +1,632 @@
+#!/usr/bin/env python
+"""End-to-end driver: dense baseline -> Phase 1 (once) -> Phase 2 (per target
+sparsity) -> perplexity + zero-shot evaluation -> JSON results.
+
+See README.md for the full method description, exact reproduction
+commands, and measured results tables.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import functools
+import json
+import os
+import time
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    import fla  # noqa: F401  -- registers HGRN/etc. architectures with transformers' Auto* classes
+except ImportError:
+    pass
+
+from ehws.admm import (
+    LocalPhase1Config, Phase1Config, Phase2Config, build_dense_states, load_phase1_checkpoint,
+    run_phase1, run_phase1_local, run_phase2, save_phase1_checkpoint, set_autocast_dtype,
+)
+from ehws.calibration import (
+    cached, get_c4_calibration, get_c4_eval, get_c4_eval_elsa, get_elsa_train_cache, get_wikitext2_test,
+    get_wikitext2_test_elsa,
+)
+from ehws.diagonal_projection import diagonal_project, magnitude_project
+from ehws.hparams import get_phase2_hparams
+from ehws.model_layers import discover_prunable_layers, disable_fused_kernels
+from ehws.obs_projection import obs_project, obs_select
+from ehws.perplexity import compute_perplexity, compute_perplexity_elsa
+from ehws.zeroshot import run_zeroshot
+
+ZSTEP_FNS = {
+    "diagonal": diagonal_project,    # ELSA's own Diag(H) score, no correction (production default)
+    "magnitude": magnitude_project,  # plain |v_i| score, no Hessian at all (real ELSA's actual default)
+    "obs_select": obs_select,        # OBS score (w^2/Hinv_jj, full off-diagonal block H), no correction
+    "obs_correct": obs_project,      # OBS score + exact joint OBS correction on survivors
+}
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", required=True)
+    p.add_argument("--sparsities", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.9])
+    p.add_argument("--zeroshot-sparsities", type=float, nargs="+", default=[0.5, 0.7, 0.9])
+    p.add_argument("--n-calib", type=int, default=1024,
+                    help="EHWS-U measured this as the second-largest lever after the LR retune "
+                         "(128 -> 1024 calibration sequences) -- see ehws/admm.py's module docstring")
+    p.add_argument("--seqlen", type=int, default=2048)
+    p.add_argument("--n-eval-c4", type=int, default=256)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--calib-cache", default=None,
+        help="directory to cache the tokenized calibration/eval tensors in, keyed by "
+             "model/n-calib/n-eval-c4/seqlen/seed. Building these scans thousands of streamed C4 "
+             "docs single-threaded with no batching -- worth sharing across parallel runs of the "
+             "same config (e.g. sweep arms) instead of redoing it once per process. Off by default.",
+    )
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--dtype", choices=["float32", "bfloat16"], default="float32",
+        help="model/teacher/ADMM-state (x,z,u,H) storage dtype. float32 is what every validated "
+             "OPT-125M result in this repo used -- keep it for reproducing those. bfloat16 is "
+             "needed at ~1.3B+ scale: model+teacher+x+z+u+H in fp32 doesn't fit in 40GB (measured "
+             "OOM on HGRN-1.3B). Z-step score ranking and the CE/KD loss still upcast to float32 "
+             "internally regardless (see diagonal_projection.py/losses.py) -- only storage shrinks.",
+    )
+    p.add_argument("--out", required=True, help="output directory for results JSON")
+    p.add_argument(
+        "--checkpoint-dir", default=None,
+        help="directory for phase1_checkpoint.pt (default: $SCRATCH/ehws-checkpoints if $SCRATCH is set, "
+             "else --out). Phase 1's checkpoint can run several GB at 1B+ scale (see ehws/admm.py's "
+             "save_phase1_checkpoint docstring for a real incident where writing it to the NFS-mounted "
+             "home filesystem got the writing job killed mid-save) -- point this at fast local/scratch "
+             "storage instead. Only results.json goes to --out.",
+    )
+
+    # Phase 1 hyperparameters -- one continuous run per layer straight at
+    # --p1-target-sparsity (no ladder; see ehws/admm.py's module docstring
+    # for why the saturation-gated ladder that used to be here was removed).
+    p.add_argument("--p1-target-sparsity", type=float, default=None,
+                    help="default: 0.7 with --p1-mode global (carried over from EHWS-U's own sweep, not "
+                         "re-swept here); the lowest of --sparsities with --p1-mode local")
+    p.add_argument(
+        "--p1-mode", choices=["global", "local"], default="global",
+        help="'global' (default, original): each layer's x-step trains against the full-model CE+KD loss "
+             "(--p1-rounds x --p1-x-steps full forward/backward passes per layer). 'local': each layer "
+             "minimizes its own reconstruction error ||(W - W0) X||^2 with a closed-form ADMM x-step "
+             "(no backprop, no teacher), then refits the kept weights; Phase 2 then starts from the "
+             "pruned weights with a zero dual. See ehws/admm.py's run_phase1_local and PROGRESS.md Session 12.",
+    )
+    p.add_argument("--p1-local-rounds", type=int, default=50, help="--p1-mode local: ADMM rounds per layer")
+    p.add_argument("--p1-local-rho-start", type=float, default=0.01,
+                    help="--p1-mode local: initial penalty, relative to mean(diag(H))")
+    p.add_argument("--p1-local-rho-end", type=float, default=10.0,
+                    help="--p1-mode local: final penalty (grown geometrically), relative to mean(diag(H))")
+    p.add_argument("--no-p1-local-refit", dest="p1_local_refit", action="store_false",
+                    help="--p1-mode local: skip the least-squares refit of kept weights on the final support")
+    p.add_argument("--p1-rounds", type=int, default=14)
+    p.add_argument("--p1-x-steps", type=int, default=4)
+    p.add_argument("--p1-lr", type=float, default=2e-4)
+    p.add_argument("--p1-lambda", type=float, default=5e-5)
+    p.add_argument(
+        "--p1-lambda-schedule", choices=["cosine", "constant"], default="cosine",
+        help="Phase 1's ADMM penalty schedule. 'cosine' (default, original behavior) ramps 0 -> "
+             "--p1-lambda per layer. Phase 1's default 5e-5 is the same value that was 200x too small "
+             "for Phase 2 (PROGRESS.md Session 5); pair 'constant' with Phase 2's own lambda (e.g. "
+             "--p1-lambda 1e-3 for OPT-125M @80%%) to test Phase 1 at a real penalty.",
+    )
+    p.add_argument("--p1-max-grad-norm", type=float, default=1.0)
+
+    # Phase 2 hyperparameters -- rounds*x_steps=4096 steps, x_steps=32 is
+    # the dual/z-update interval, matching real ELSA's Table 4 exactly
+    # ("Training steps: 4096", "Interval k: 32")
+    p.add_argument("--p2-rounds", type=int, default=128)
+    p.add_argument("--p2-x-steps", type=int, default=32)
+    p.add_argument("--p2-lr", type=float, default=1e-4)
+    p.add_argument("--p2-lambda-max", type=float, default=5e-5)
+    p.add_argument(
+        "--p2-lambda-schedule", choices=["cosine", "constant"], default="cosine",
+        help="only used with --no-auto-hparams (auto-hparams' own per-model/per-sparsity table -- "
+             "ehws/hparams.py -- already picks the right schedule per entry). Previously hardcoded "
+             "to 'cosine' here regardless of what was passed; real ELSA's actual HGRN-1.3B@80%% run "
+             "(ELSA-official/results/hgrn-1.3b-0.8/run.log) used 'constant', which a manual "
+             "--no-auto-hparams override couldn't express until this flag was added.",
+    )
+    p.add_argument("--p2-max-grad-norm", type=float, default=1.0)
+    p.add_argument(
+        "--p2-dual-init", choices=["carry", "rescale", "zero"], default="rescale",
+        help="how Phase 1's scaled dual u enters Phase 2 (see ehws/admm.py's Phase2Config.dual_init). "
+             "'rescale' (default since Session 10) keeps the real dual lambda*u unchanged across the "
+             "handoff; 'carry' (original behavior) hands u over as-is, so lambda*u jumps by "
+             "lambda_p2/lambda_p1; 'zero' resets "
+             "u. No effect with --skip-phase1 (u starts at 0 there). Phase-2-only, so a saved Phase 1 "
+             "checkpoint can be reused across all three.",
+    )
+
+    p.add_argument("--micro-batch", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=4)  # effective batch = micro_batch * grad_accum
+    p.add_argument(
+        "--p2-micro-batch", type=int, default=None,
+        help="override --micro-batch for Phase 2 only (default: same as --micro-batch). Phase 2's "
+             "KD-loss computation (float32 log_softmax/softmax over the full vocab, real seqlen) is "
+             "the tightest point in the whole pipeline's memory budget at 1B+ scale -- measured OOM "
+             "there on HGRN-1.3B even after every other memory fix. Lowering only this (with "
+             "--p2-grad-accum raised to match, preserving the same effective batch) fixes it without "
+             "slowing down Phase 1, which doesn't need it.",
+    )
+    p.add_argument("--p2-grad-accum", type=int, default=None, help="override --grad-accum for Phase 2 only")
+    p.add_argument("--alpha-kd", type=float, default=0.5)
+    p.add_argument(
+        "--kd-temperature", type=float, default=1.0,
+        help="softens both student/teacher distributions before the KD term (Hinton et al. convention: "
+             "divide logits by T, then scale KD by T^2). 1.0 (default) = untempered, original behavior. "
+             "Not something real ELSA has any analogue for -- it has no KD term to temper -- so this is "
+             "purely an EHWS addition (ehws/losses.py's combined_loss docstring has the full derivation).",
+    )
+    p.add_argument("--damping", type=float, default=0.01)
+    p.add_argument(
+        "--hessian-n-calib", type=int, default=None,
+        help="measure each layer's Hessian on only the first N calibration sequences instead of all "
+             "--n-calib of them (default: all, the original behavior). Hessian passes were ~half of "
+             "Phase 1's compute at --n-calib 2048; the diagonal the default Z-step uses converges with "
+             "a few hundred sequences (e.g. 256).",
+    )
+    p.add_argument(
+        "--full-hessian", action="store_true",
+        help="store full d_in x d_in Hessians even for --zstep diagonal/magnitude, which only read "
+             "the diagonal (default: diagonal only for those two, full matrices for obs_select/"
+             "obs_correct). Same Z-step result either way up to float rounding; only for checking that.",
+    )
+    p.add_argument(
+        "--adam-beta1", type=float, default=0.9, help="Adam beta1 for both Phase 1 and Phase 2's optimizer",
+    )
+    p.add_argument(
+        "--adam-beta2", type=float, default=0.999,
+        help="Adam beta2. Default 0.999 is PyTorch's stock default -- NOT what real ELSA actually "
+             "configures (0.95, via admm_beta2 in ELSA-official/lib/trainer.py). Pass 0.95 to match "
+             "real ELSA; beta2=0.999's ~1000-step averaging window barely adapts within Phase 1's "
+             "56-step-per-layer runs, unlike ELSA's own tuning assumption.",
+    )
+    p.add_argument(
+        "--no-prox-after-clip", dest="prox_after_clip", action="store_false",
+        help="add the ADMM proximal-term gradient inside the backpropped loss (pre-clip) instead of "
+             "after clip_grad_norm_. Default (on, matching real ELSA's ADMMOptimizer._proximal_update "
+             "exactly -- ELSA-official/lib/optimizers.py's own comment: 'This ensures proximal is not "
+             "clipped') keeps only the task loss clipped and adds the proximal gradient after; passing "
+             "this flag reverts to the original EHWS behavior of clipping the combined task+proximal "
+             "gradient together, which can attenuate the ADMM constraint pull whenever the combined "
+             "norm exceeds --p2-max-grad-norm/--p1-max-grad-norm. Made the default 2026-09-11 after "
+             "the opt-125m-fixablation-prox-after-clip ablation beat the prior default on both WT2 "
+             "(85.98 vs 90.59) and C4 (52.68 vs 53.86) @80%% sparsity -- see PROGRESS.md.",
+    )
+    p.set_defaults(prox_after_clip=True)
+    p.add_argument(
+        "--no-auto-hparams", action="store_true",
+        help="disable per-model/per-sparsity (lr, lambda, schedule) lookup (ehws/hparams.py) "
+             "and use the fixed --p2-lr/--p2-lambda-max/cosine schedule for every sparsity level instead",
+    )
+    p.add_argument("--skip-zeroshot", action="store_true")
+    p.add_argument(
+        "--no-elsa-eval", dest="elsa_eval", action="store_false",
+        help="skip the extra ELSA-protocol perplexities (wikitext2_ppl_elsa/c4_ppl_elsa: ELSA-official's C4 test "
+             "set and formula, slow tokenizer, float16 copy of the model) -- these match ELSA's own printed numbers "
+             "exactly; c4_ppl (our protocol) is not comparable to ELSA's C4",
+    )
+    p.add_argument(
+        "--skip-phase1", action="store_true",
+        help="cold-start ablation: skip Phase 1 entirely, run Phase 2 directly from the dense model "
+             "(x=z=dense weights, u=0) -- isolates whether Phase 1's warm-start is actually helping",
+    )
+    p.add_argument(
+        "--skip-phase2", action="store_true",
+        help="Phase-1-only ablation: run Phase 1 straight at --p1-target-sparsity (overriding its "
+             "default 0.7 warm-start value to whatever sparsity you actually want evaluated) and "
+             "evaluate directly on its output, without a Phase 2 global fine-tune. --sparsities is "
+             "ignored in this mode -- the evaluated sparsity is --p1-target-sparsity.",
+    )
+    p.add_argument(
+        "--gradient-checkpointing", action="store_true",
+        help="trade compute for activation memory on the student model's forward/backward pass -- "
+             "recomputes activations during backward instead of storing them from the forward pass. "
+             "Needed at 1B+ scale: measured OOM inside .backward() on HGRN-1.3B even after every "
+             "other memory fix (bf16, Hessian offload, foreach=False Adam, smaller --p2-micro-batch). "
+             "No effect on results, only speed (more recompute) vs. memory (less storage).",
+    )
+    p.add_argument(
+        "--master-fp32", action="store_true",
+        help="with --dtype bfloat16: keep the student's weights, grads and Adam state in float32 and run its "
+             "forward under bf16 autocast (ELSA's setup: fp32 model + Trainer bf16=True). The teacher stays bf16; "
+             "ADMM z/u are stored in bf16 (ELSA's --admm_split_dtype/--admm_dual_dtype bf16). Without it, "
+             "--dtype bfloat16 trains the bf16 weights directly, where small late-schedule Adam updates round away.",
+    )
+    p.add_argument(
+        "--elsa-train-cache", default=None,
+        help="train on ELSA-official's own tokenized C4 training set (the directory its --admm_save_inputs=True "
+             "writes, e.g. ELSA-official/dataset/fla-hub_hgrn-1.3B-100B/train/c4_32768_2048_hub) instead of "
+             "--n-calib sequences from get_c4_calibration. --n-calib is ignored. Hessians still use the first "
+             "--hessian-n-calib sequences.",
+    )
+    p.add_argument("--p2-epoch-sampling", action="store_true",
+                    help="Phase 2 draws batches without replacement (one pass over the data, reshuffled after), as "
+                         "ELSA's Trainer does, instead of sampling with replacement")
+    p.add_argument("--p2-train-extra", action="store_true",
+                    help="Phase 2 also trains every non-pruned parameter (norms, embeddings, lm_head, HGRN forget-gate "
+                         "lower bounds) with the same Adam/lr and no penalty, as ELSA does")
+    p.add_argument("--p2-hessian-refresh", action="store_true",
+                    help="re-measure each layer's diag(H) for the Z-step from Phase 2's own training forwards since the "
+                         "previous Z-step (needs --zstep diagonal; no extra passes)")
+    p.add_argument("--zstep-hessian-power", type=float, default=1.0,
+                    help="Phase 2 Z-step score H_ii**power * v**2 (needs --zstep diagonal). 1.0 = current Diag(H) "
+                         "score; 0.5 tempers OPT's huge-activation input channels; 0 = magnitude. Phase 1 is unchanged.")
+    p.add_argument("--p2-hessian-ema", type=float, default=0.0,
+                    help="with --p2-hessian-refresh: H <- beta*H + (1-beta)*H_window instead of replacing it (0 = replace)")
+    p.add_argument("--p2-train-extra-scope", choices=["all", "norms"], default="all",
+                    help="with --p2-train-extra: train every non-pruned parameter (all, ELSA's choice) or only LayerNorms")
+    p.add_argument("--smoke-test", action="store_true", help="tiny settings, for pipeline validation only")
+    p.add_argument(
+        "--save-model", action="store_true",
+        help="save the pruned model + tokenizer via save_pretrained() after each requested sparsity's "
+             "Phase 2 finishes, to <out>/model-s<sparsity>/ -- needed to later push a checkpoint anywhere "
+             "(e.g. HuggingFace Hub); no run so far in this repo has persisted actual pruned weights, "
+             "only the results.json metrics.",
+    )
+    p.add_argument(
+        "--zstep", choices=list(ZSTEP_FNS.keys()), default="diagonal",
+        help="Z-step selection+correction mechanism, used by both Phase 1 and Phase 2 (same "
+             "zstep_fn at both call sites, matching how --sparsities/--p1-target-sparsity already "
+             "share one mechanism across phases). 'diagonal' (default): ELSA's own Diag(H) score, "
+             "survivors unchanged. 'magnitude': plain |v_i| score, no Hessian involved at all -- "
+             "matches real ELSA's actual default projection mode; isolates whether 'diagonal's "
+             "Hessian weighting itself (not just its damping) is the problem on ill-conditioned "
+             "real-data Hessians. 'obs_select': full off-diagonal-block OBS score (w^2/Hinv_jj), "
+             "survivors still left unchanged (no correction) -- isolates selection quality from "
+             "correction. 'obs_correct': OBS score + exact joint OBS correction on survivors "
+             "(ehws/obs_projection.py's obs_project). See obs_projection.py's module docstring for "
+             "the full 2x2 this set of three points into.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device)
+    os.makedirs(args.out, exist_ok=True)
+    torch.manual_seed(args.seed)
+    if args.p1_target_sparsity is None:
+        args.p1_target_sparsity = min(args.sparsities) if args.p1_mode == "local" else 0.7
+
+    if args.smoke_test:
+        args.n_calib, args.seqlen, args.n_eval_c4 = 8, 256, 8
+        args.p1_rounds, args.p1_x_steps = 2, 1
+        args.p2_rounds, args.p2_x_steps = 2, 1
+        args.micro_batch, args.grad_accum = 1, 1
+
+    if args.master_fp32 and args.dtype != "bfloat16":
+        raise SystemExit("--master-fp32 needs --dtype bfloat16 (the autocast/teacher dtype)")
+
+    print(f"Loading tokenizer/model: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=getattr(torch, args.dtype))
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    n_defused = disable_fused_kernels(model)
+    if n_defused:
+        print(f"  disabled {n_defused} fused-kernel module(s) (e.g. fla's GatedMLP.fuse_swiglu) "
+              f"so every prunable layer's forward_pre_hook actually fires -- see model_layers.py")
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        print("  gradient checkpointing enabled on the student model (trades compute for activation memory; "
+              "the teacher never needs backward, so it's left as-is)")
+
+    print("Building frozen teacher copy (pre-pruning dense weights)")
+    teacher = copy.deepcopy(model)
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher.eval()
+    if args.master_fp32:
+        model.float()
+        set_autocast_dtype(torch.bfloat16)
+        torch.backends.cuda.matmul.allow_tf32 = True  # float32 eval/zero-shot matmuls (training runs under autocast)
+        print("  student weights/grads/Adam in float32, forward under bf16 autocast; teacher stays bf16")
+
+    model_tag = args.model.replace("/", "_")
+
+    def _cache_file(name: str) -> str | None:
+        if args.calib_cache is None:
+            return None
+        return os.path.join(
+            args.calib_cache,
+            f"{model_tag}_{name}_n{args.n_calib if name == 'calib' else args.n_eval_c4}"
+            f"_seq{args.seqlen}_seed{args.seed if name == 'calib' else args.seed + 1}.pt",
+        )
+
+    if args.elsa_train_cache:
+        print(f"Loading ELSA's tokenized training set: {args.elsa_train_cache}")
+        name = os.path.basename(os.path.normpath(args.elsa_train_cache))
+        calib_ids = cached(
+            os.path.join(args.calib_cache, f"{model_tag}_elsatrain_{name}.pt") if args.calib_cache else None,
+            lambda: get_elsa_train_cache(args.elsa_train_cache),
+        )
+        if args.smoke_test:
+            calib_ids = calib_ids[:64, : args.seqlen]
+        if calib_ids.shape[1] != args.seqlen:
+            raise SystemExit(f"ELSA cache has seqlen {calib_ids.shape[1]}, --seqlen is {args.seqlen}")
+        args.n_calib = calib_ids.shape[0]
+        print(f"  {tuple(calib_ids.shape)} sequences")
+    else:
+        print(f"Loading calibration data: C4, n={args.n_calib}, seqlen={args.seqlen}")
+        calib_ids = cached(
+            _cache_file("calib"),
+            lambda: get_c4_calibration(tokenizer, n_samples=args.n_calib, seqlen=args.seqlen, seed=args.seed),
+        )
+
+    print("Loading perplexity eval sets: WikiText-2 test, C4 validation")
+    wt2_ids = cached(
+        os.path.join(args.calib_cache, f"{model_tag}_wt2_seq{args.seqlen}.pt") if args.calib_cache else None,
+        lambda: get_wikitext2_test(tokenizer, seqlen=args.seqlen),
+    )
+    c4_eval_ids = cached(
+        _cache_file("c4eval"),
+        lambda: get_c4_eval(tokenizer, n_samples=args.n_eval_c4, seqlen=args.seqlen, seed=args.seed + 1),
+    )
+
+    results = {"model": args.model, "config": vars(args), "dense": {}, "sparsity": {}}
+
+    elsa_sets = None
+    if args.elsa_eval:
+        slow_tok = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        elsa_sets = (
+            cached(os.path.join(args.calib_cache, f"{model_tag}_wt2_elsa_seq{args.seqlen}.pt") if args.calib_cache else None,
+                   lambda: get_wikitext2_test_elsa(slow_tok, seqlen=args.seqlen)),
+            cached(os.path.join(args.calib_cache, f"{model_tag}_c4_elsa_seq{args.seqlen}.pt") if args.calib_cache else None,
+                   lambda: get_c4_eval_elsa(slow_tok, seqlen=args.seqlen)),
+        )
+
+    def elsa_eval(entry: dict) -> None:
+        """ELSA-official's protocol, on a float16 copy so the live model's weights are untouched."""
+        if elsa_sets is None:
+            return
+        m16 = copy.deepcopy(model).half()
+        entry["wikitext2_ppl_elsa"] = compute_perplexity_elsa(m16, elsa_sets[0], device)
+        entry["c4_ppl_elsa"] = compute_perplexity_elsa(m16, elsa_sets[1], device)
+        del m16
+        torch.cuda.empty_cache()
+        print(f"  ELSA protocol: wikitext2={entry['wikitext2_ppl_elsa']:.3f} c4={entry['c4_ppl_elsa']:.3f}", flush=True)
+
+    print("Evaluating dense baseline perplexity")
+    t0 = time.time()
+    results["dense"]["wikitext2_ppl"] = compute_perplexity(model, wt2_ids, device)
+    results["dense"]["c4_ppl"] = compute_perplexity(model, c4_eval_ids, device)
+    print(f"  wikitext2={results['dense']['wikitext2_ppl']:.3f} c4={results['dense']['c4_ppl']:.3f} ({time.time()-t0:.1f}s)")
+    elsa_eval(results["dense"])
+
+    if not args.skip_zeroshot:
+        print("Evaluating dense baseline zero-shot accuracy")
+        results["dense"]["zeroshot"] = run_zeroshot(model, tokenizer, device)
+        print(f"  {results['dense']['zeroshot']}")
+
+    print("Discovering prunable layers (execution-order trace)")
+    layers = discover_prunable_layers(model, calib_ids[:1].to(device))
+    print(f"  found {len(layers)} prunable nn.Linear layers")
+
+    # Checkpoint Phase 1's (or build_dense_states') output -- both can take
+    # hours at 1B+ parameter scale, and losing that to an unrelated Phase 2
+    # crash (a real incident: HGRN-1.3B's Phase 1 took ~4.5h, then Phase 2
+    # OOM'd immediately on entering training) means redoing all of it just
+    # to retry Phase 2. `meta` ties the checkpoint to the exact run
+    # configuration it's valid for -- see save_phase1_checkpoint/
+    # load_phase1_checkpoint's docstrings in ehws/admm.py.
+    checkpoint_dir = args.checkpoint_dir
+    if checkpoint_dir is None:
+        scratch = os.environ.get("SCRATCH")
+        checkpoint_dir = os.path.join(scratch, "ehws-checkpoints", os.path.basename(os.path.normpath(args.out))) if scratch else args.out
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    p1_checkpoint_path = os.path.join(checkpoint_dir, "phase1_checkpoint.pt")
+    diag_only = args.zstep in ("diagonal", "magnitude") and not args.full_hessian
+    p1_meta = {
+        "model": args.model, "dtype": args.dtype, "seed": args.seed,
+        "skip_phase1": args.skip_phase1,
+        "p1_target_sparsity": None if args.skip_phase1 else args.p1_target_sparsity,
+        # Everything else Phase 1's output depends on, so a checkpoint from a
+        # different Phase 1 config is rejected instead of silently reused.
+        "p1": None if args.skip_phase1 else {
+            "lambda": args.p1_lambda, "lambda_schedule": args.p1_lambda_schedule, "lr": args.p1_lr,
+            "rounds": args.p1_rounds, "x_steps": args.p1_x_steps, "zstep": args.zstep,
+        } if args.p1_mode == "global" else {
+            "mode": "local", "rounds": args.p1_local_rounds, "rho_start": args.p1_local_rho_start,
+            "rho_end": args.p1_local_rho_end, "refit": args.p1_local_refit, "zstep": args.zstep,
+        },
+        "hessian_n_calib": args.hessian_n_calib,
+        # Not used for anything except the checkpoint-compatibility check below,
+        # but the H recompute in load_phase1_checkpoint depends on all three
+        # matching exactly (they determine calib_ids and the Hessian damping) --
+        # a stale checkpoint made under different values must be rejected, not
+        # silently reused with a mismatched Hessian.
+        "n_calib": args.n_calib, "seqlen": args.seqlen, "damping": args.damping,
+    }
+    # Added with --master-fp32/--elsa-train-cache; only present when used, so older checkpoints still match.
+    if args.master_fp32:
+        p1_meta["master_fp32"] = True
+    if args.elsa_train_cache:
+        p1_meta["elsa_train_cache"] = os.path.basename(os.path.normpath(args.elsa_train_cache))
+    t0 = time.time()
+    if os.path.exists(p1_checkpoint_path):
+        print(f"Found Phase 1 checkpoint at {p1_checkpoint_path} -- loading instead of recomputing")
+        phase1_states = load_phase1_checkpoint(
+            p1_checkpoint_path, layers, device, p1_meta,
+            model, calib_ids, args.seqlen, args.damping,
+            hessian_n_calib=args.hessian_n_calib, diag_only=diag_only,
+        )
+        print(f"Checkpoint loaded in {time.time()-t0:.1f}s")
+        results["phase1_summary"] = "loaded from checkpoint"
+    elif args.skip_phase1:
+        print("=" * 30, "PHASE 1: SKIPPED (--skip-phase1 cold-start ablation)", "=" * 30)
+        phase1_states = build_dense_states(
+            model, layers, calib_ids, args.seqlen, device, args.damping,
+            hessian_n_calib=args.hessian_n_calib, diag_only=diag_only,
+        )
+        print(f"Cold-start Hessians computed in {time.time()-t0:.1f}s")
+        results["phase1_summary"] = "skipped (--skip-phase1 cold-start ablation)"
+        save_phase1_checkpoint(phase1_states, p1_checkpoint_path, p1_meta)
+        print(f"Checkpoint saved to {p1_checkpoint_path}")
+    elif args.p1_mode == "local":
+        print("=" * 30, f"PHASE 1: local reconstruction ADMM, target_sparsity={args.p1_target_sparsity:.2f}", "=" * 30)
+        p1_cfg = LocalPhase1Config(
+            target_sparsity=args.p1_target_sparsity, rounds=args.p1_local_rounds,
+            rho_start=args.p1_local_rho_start, rho_end=args.p1_local_rho_end, refit=args.p1_local_refit,
+            damping=args.damping, hessian_n_calib=args.hessian_n_calib, diag_only_hessian=diag_only,
+        )
+        phase1_states = run_phase1_local(model, layers, calib_ids, p1_cfg, device, zstep_fn=ZSTEP_FNS[args.zstep])
+        print(f"Phase 1 complete in {time.time()-t0:.1f}s", flush=True)
+        results["phase1_summary"] = {
+            name: {"final_sparsity": s.final_sparsity} for name, s in phase1_states.items()
+        }
+        save_phase1_checkpoint(phase1_states, p1_checkpoint_path, p1_meta)
+        print(f"Checkpoint saved to {p1_checkpoint_path}")
+    else:
+        print("=" * 30, "PHASE 1: layer-wise ADMM", "=" * 30)
+        p1_cfg = Phase1Config(
+            target_sparsity=args.p1_target_sparsity, rounds=args.p1_rounds, x_steps=args.p1_x_steps,
+            micro_batch=args.micro_batch, grad_accum=args.grad_accum, lr=args.p1_lr,
+            admm_lambda_max=args.p1_lambda, lambda_schedule=args.p1_lambda_schedule,
+            alpha_kd=args.alpha_kd, kd_temperature=args.kd_temperature,
+            damping=args.damping, hessian_n_calib=args.hessian_n_calib, diag_only_hessian=diag_only,
+            seqlen=args.seqlen, max_grad_norm=args.p1_max_grad_norm,
+            beta1=args.adam_beta1, beta2=args.adam_beta2, prox_after_clip=args.prox_after_clip,
+        )
+        phase1_states = run_phase1(model, teacher, layers, calib_ids, p1_cfg, device, zstep_fn=ZSTEP_FNS[args.zstep])
+        print(f"Phase 1 complete in {time.time()-t0:.1f}s")
+        results["phase1_summary"] = {
+            name: {"final_sparsity": s.final_sparsity} for name, s in phase1_states.items()
+        }
+        save_phase1_checkpoint(phase1_states, p1_checkpoint_path, p1_meta)
+        print(f"Checkpoint saved to {p1_checkpoint_path}")
+
+    if args.skip_phase2:
+        print("=" * 30, f"PHASE 2: SKIPPED -- evaluating Phase 1 output directly at target_sparsity={args.p1_target_sparsity:.2f}", "=" * 30)
+        achieved = sum(s.final_sparsity * s.n_in * s.n_out for s in phase1_states.values())
+        total = sum(s.n_in * s.n_out for s in phase1_states.values())
+        entry = {
+            "target_sparsity": args.p1_target_sparsity,
+            "achieved_sparsity": achieved / total,
+            "wikitext2_ppl": compute_perplexity(model, wt2_ids, device),
+            "c4_ppl": compute_perplexity(model, c4_eval_ids, device),
+        }
+        print(f"  achieved_sparsity={entry['achieved_sparsity']:.4f} wikitext2={entry['wikitext2_ppl']:.3f} c4={entry['c4_ppl']:.3f}")
+        elsa_eval(entry)
+        if not args.skip_zeroshot:
+            entry["zeroshot"] = run_zeroshot(model, tokenizer, device)
+            print(f"  zeroshot={entry['zeroshot']}")
+        results["sparsity"][str(args.p1_target_sparsity)] = entry
+        with open(os.path.join(args.out, "results.json"), "w") as f:
+            json.dump(results, f, indent=2)
+        if os.path.exists(p1_checkpoint_path):
+            os.remove(p1_checkpoint_path)  # run finished successfully -- nothing left to resume
+        print(f"Done (Phase-1-only ablation). Results written to {os.path.join(args.out, 'results.json')}")
+        return
+
+    for sparsity in args.sparsities:
+        print("=" * 30, f"PHASE 2: global ADMM, target sparsity={sparsity:.2f}", "=" * 30)
+        if args.no_auto_hparams:
+            lr, lam, schedule = args.p2_lr, args.p2_lambda_max, args.p2_lambda_schedule
+        else:
+            lr, lam, schedule = get_phase2_hparams(args.model, sparsity)
+            print(f"  auto hparams (ehws/hparams.py): lr={lr} lambda={lam} schedule={schedule}")
+        p2_cfg = Phase2Config(
+            target_sparsity=sparsity, rounds=args.p2_rounds, x_steps=args.p2_x_steps,
+            micro_batch=args.p2_micro_batch if args.p2_micro_batch is not None else args.micro_batch,
+            grad_accum=args.p2_grad_accum if args.p2_grad_accum is not None else args.grad_accum,
+            lr=lr,
+            admm_lambda_max=lam, lambda_schedule=schedule, alpha_kd=args.alpha_kd,
+            kd_temperature=args.kd_temperature, seqlen=args.seqlen,
+            max_grad_norm=args.p2_max_grad_norm, dual_init=args.p2_dual_init,
+            beta1=args.adam_beta1, beta2=args.adam_beta2, prox_after_clip=args.prox_after_clip,
+            state_dtype=torch.bfloat16 if args.master_fp32 else None,
+            train_extra=args.p2_train_extra, hessian_refresh=args.p2_hessian_refresh, damping=args.damping,
+            epoch_sampling=args.p2_epoch_sampling, seed=args.seed,
+            hessian_ema=args.p2_hessian_ema, train_extra_scope=args.p2_train_extra_scope,
+        )
+        t0 = time.time()
+        p2_zstep = ZSTEP_FNS[args.zstep]
+        if args.zstep_hessian_power != 1.0:
+            if args.zstep != "diagonal":
+                raise SystemExit("--zstep-hessian-power needs --zstep diagonal")
+            p2_zstep = functools.partial(diagonal_project, hessian_power=args.zstep_hessian_power)
+        phase2_states = run_phase2(model, teacher, phase1_states, calib_ids, p2_cfg, device, zstep_fn=p2_zstep)
+        print(f"Phase 2 (s={sparsity:.2f}) complete in {time.time()-t0:.1f}s")
+
+        achieved = sum(s.final_sparsity * s.n_in * s.n_out for s in phase2_states.values())
+        total = sum(s.n_in * s.n_out for s in phase2_states.values())
+        del phase2_states  # its z/u copies are no longer needed; free them before evaluation
+        torch.cuda.empty_cache()
+        entry = {
+            "target_sparsity": sparsity,
+            "achieved_sparsity": achieved / total,
+            # What Phase 2 actually used. With auto-hparams on, config's --p2-lr /
+            # --p2-lambda-max / --p2-lambda-schedule are ignored defaults.
+            "p2_hparams": {"lr": lr, "lambda": lam, "schedule": schedule,
+                           "source": "manual" if args.no_auto_hparams else "auto (ehws/hparams.py)"},
+            "wikitext2_ppl": compute_perplexity(model, wt2_ids, device),
+            "c4_ppl": compute_perplexity(model, c4_eval_ids, device),
+        }
+        print(f"  achieved_sparsity={entry['achieved_sparsity']:.4f} wikitext2={entry['wikitext2_ppl']:.3f} c4={entry['c4_ppl']:.3f}")
+        elsa_eval(entry)
+
+        if not args.skip_zeroshot and sparsity in args.zeroshot_sparsities:
+            entry["zeroshot"] = run_zeroshot(model, tokenizer, device)
+            print(f"  zeroshot={entry['zeroshot']}")
+
+        results["sparsity"][str(sparsity)] = entry
+
+        with open(os.path.join(args.out, "results.json"), "w") as f:
+            json.dump(results, f, indent=2)
+
+        if args.save_model:
+            save_dir = os.path.join(args.out, f"model-s{sparsity}")
+            os.makedirs(save_dir, exist_ok=True)
+            # model.save_pretrained() crashes for fla-hub/HGRN models: transformers'
+            # remove_tied_weights_from_state_dict -> _get_tied_weight_keys calls
+            # `._tied_weights_keys.keys()` assuming a dict, but flash-linear-attention's
+            # HGRNForCausalLM sets it as a list (older transformers convention) ->
+            # AttributeError: 'list' object has no attribute 'keys'. HGRN's own config has
+            # tie_word_embeddings=False, so there's no real weight aliasing to worry about --
+            # save the raw state dict directly instead of going through save_pretrained().
+            from safetensors.torch import save_file
+            # Move to CPU before serializing: building a contiguous state_dict copy
+            # while the model is still on GPU stacks on top of whatever GPU memory
+            # training/eval already used (observed as high as 38.4/40GB on this card),
+            # and a CUDA OOM at this point can kill the process before Python's
+            # traceback even gets flushed (a prior run died here with zero trace).
+            # 480GB system RAM makes CPU a much safer place to hold ~2.6GB of weights.
+            print(f"  moving model to CPU before saving...", flush=True)
+            model.to("cpu")
+            print(f"  building state_dict...", flush=True)
+            # Skip tied duplicates (e.g. OPT's lm_head.weight is embed_tokens.weight):
+            # safetensors refuses tensors that share memory. Loading into the base model
+            # re-ties them, so nothing is lost.
+            state_dict, seen = {}, set()
+            for k, v in model.state_dict().items():
+                if v.data_ptr() in seen:
+                    continue
+                seen.add(v.data_ptr())
+                state_dict[k] = v.contiguous()
+            print(f"  writing safetensors to {save_dir}...", flush=True)
+            save_file(state_dict, os.path.join(save_dir, "model.safetensors"))
+            model.config.save_pretrained(save_dir)
+            if getattr(model, "generation_config", None) is not None:
+                model.generation_config.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+            model.to(device)
+            print(f"  model saved to {save_dir}", flush=True)
+
+    if os.path.exists(p1_checkpoint_path):
+        os.remove(p1_checkpoint_path)  # every requested sparsity finished successfully -- nothing left to resume
+    print(f"Done. Results written to {os.path.join(args.out, 'results.json')}")
+
+
+if __name__ == "__main__":
+    main()

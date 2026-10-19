@@ -59,11 +59,20 @@ non-pruned parameters (norms, embeddings, lm_head) with no penalty
 (`--p2-train-extra`), and re-measure diag(H) for the Z-step from its own
 training forward passes (`--p2-hessian-refresh`).
 
-## Measured result
+## Measured results
 
-`fla-hub/hgrn-1.3B-100B`, 80% sparsity. Perplexity uses ELSA-official's
-own evaluation protocol (its WikiText-2 / C4 test sets and formula, fp16),
-so every row is directly comparable. All rows are single runs.
+Both models at 80% sparsity. Perplexity uses ELSA-official's own
+evaluation protocol (its WikiText-2 / C4 test sets and formula, fp16), so
+every row is directly comparable. All rows are single runs.
+
+| Model | This method (WT2 / C4) | ELSA, same row-wise constraint | ELSA, unstructured |
+|---|---|---|---|
+| HGRN-1.3B | **46.49 / 34.58** | 58.79 / 40.30 | 54.08 / 36.92 |
+| OPT-125M | **66.65 / 49.45** | 75.86 / 53.45 | 65.30 / 47.74 (paper) |
+
+### HGRN-1.3B
+
+`fla-hub/hgrn-1.3B-100B`, 80% sparsity.
 
 | | Sparsity type | WikiText2 PPL | C4 PPL |
 |---|---|---|---|
@@ -94,6 +103,37 @@ An earlier audit against ELSA's own run on this model is also why any of
 this works: it showed the ADMM penalty (`lambda`) had been 200x too small
 for HGRN (`0.01` constant in ELSA's run vs `5e-5` cosine-ramped here).
 See `ehws/hparams.py`'s module docstring.
+
+### OPT-125M
+
+`facebook/opt-125m`, 80% sparsity.
+
+| | Sparsity type | WikiText2 PPL | C4 PPL |
+|---|---|---|---|
+| Dense | -- | 27.61 | 26.52 |
+| ELSA paper | unstructured | 65.30 | 47.74 |
+| **Two-phase, local (ALPS) Phase 1 (this method)** | **semi-structured** | **66.65** | **49.45** |
+| ELSA official code | semi-structured (same per-row constraint) | 75.86 | 53.45 |
+
+The ELSA unstructured row is the paper's own number (paper evaluation;
+its dense row is ~0.15% off ELSA's released code). Zero-shot accuracy was
+not measured for this run. The weights are on Hugging Face:
+[ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct).
+
+This beats ELSA under the same row-wise constraint by 12% (WikiText2) and
+7.5% (C4), and is within 2.1% / 3.6% of ELSA's unstructured result. It uses
+the same local Phase 1 and Phase 2 data / extras / H-refresh options as
+HGRN (OPT-125M always trained in float32), with two OPT-specific Phase 2
+settings found by sweeping:
+- ADMM penalty `lambda = 3e-3`, constant. ELSA's own OPT-125M value is
+  1e-3 (82.31 / 55.69 here). 2e-3, 5e-3 and 1e-2 were all worse, and a
+  cosine ramp to 1e-2 was much worse (94.40 / 63.56).
+- Phase 2 `lr = 4e-4` (6e-4: 73.85 / 52.52; 9e-4: 145.67 / 85.60).
+
+The sweeps are in `PROGRESS.md` (Sessions 17-19). They ran from
+`../opt125m/`, a copy of this code with a few extra OPT-only options, all
+off for this result, so the command below gives the same run from either
+folder.
 
 ## Running HGRN-1.3B (80% sparsity)
 
@@ -144,6 +184,28 @@ python run_pipeline.py --model fla-hub/hgrn-1.3B-100B \
 run-to-run variance, not bit-exact reproduction: repeats of identical
 configs have moved WikiText2 by up to ~5% (C4 is much more stable). See
 `PROGRESS.md`.
+
+## Running OPT-125M (80% sparsity)
+
+**Two-phase with local Phase 1 (66.65 / 49.45 above).** Same environment
+and ELSA training cache as for HGRN (here, ELSA's OPT-125M cache):
+
+```bash
+python run_pipeline.py --model facebook/opt-125m \
+  --sparsities 0.8 --seqlen 2048 --n-eval-c4 256 --dtype float32 \
+  --p1-mode local --hessian-n-calib 256 \
+  --elsa-train-cache ELSA-official/dataset/facebook_opt-125m/train/c4_32768_2048_hub \
+  --p2-epoch-sampling --p2-train-extra --p2-hessian-refresh \
+  --no-auto-hparams --p2-lr 4e-4 --p2-lambda-max 3e-3 --p2-lambda-schedule constant --adam-beta2 0.999 \
+  --skip-zeroshot --save-model \
+  --out results/opt-125m-0.8
+```
+
+`--no-auto-hparams` and the four values after it are required: the
+auto-hparams table would use ELSA's lambda 1e-3. Unlike HGRN, Adam
+`beta2` stays at 0.999 (0.95 was worse on OPT-125M). Each run needs
+~14-19 GB, so two fit on one A100-40GB; with two sharing a GPU, each took
+about 3.5h wall-clock.
 
 ## Hyperparameters
 
