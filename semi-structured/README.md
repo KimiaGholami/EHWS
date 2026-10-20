@@ -1,277 +1,225 @@
-# EHWS -- semi-structured ADMM pruning
+# EHWS: semi-structured pruning of language models with ADMM
 
-EHWS stands for Extreme Hierarchical Weight Sparsity. A two-phase pruning method for causal language models that trains
-directly against the true next-token loss under a hard sparsity
-constraint, instead of matching each layer's dense output on calibration
-data and hoping that adds up to a good model. It extends
-[ELSA](https://arxiv.org/abs/2510.01650) (*The Unseen Frontier: Pushing
-the Limits of LLM Sparsity with Surrogate-Free ADMM*), which makes the
-same argument for a single flat optimization; this method splits it into
-a cheap per-layer warm start followed by one global fine-tune, so you
-only pay for the expensive part once per model instead of once per
-sparsity level.
+EHWS (Extreme Hierarchical Weight Sparsity) removes most of the weights of a
+language model, for example 80%, and keeps its quality as high as possible.
 
-"Semi-structured" here means every row of every prunable linear layer
-keeps exactly the same number of weights (e.g. the top 20% at 80%
-sparsity). Unstructured pruning, by contrast, lets rows and layers end up
-with different amounts pruned. Which weights survive within a row is
-still free (no fixed block pattern such as 2:4).
+It builds on [ELSA](https://arxiv.org/abs/2510.01650). ELSA prunes a model by
+training it on its real next-token loss while forcing the weights toward a
+sparse pattern, using ADMM. EHWS adds a fast first step that prunes each layer
+on its own (Phase 1, based on [ALPS](https://arxiv.org/abs/2406.07831)). The
+ELSA-style training then starts from that already-pruned model (Phase 2).
 
-## Method
+**Semi-structured** means every row of every pruned layer keeps exactly the
+same number of weights. At 80% sparsity, each row keeps its top 20%. Which
+weights survive within a row is free, so there is no fixed block pattern
+like 2:4.
 
-Both phases are the same ADMM structure: a dense trainable copy of the
-weights `x`, a sparse projection of it `z`, and a dual variable `u` that
-tracks how far apart they are.
+## Results
 
-```
-x <- argmin_x  f(x) + (lambda/2) ||x - z + u||^2      (train against the true loss)
-z <- argmin_{||z||_0<=k} (z-v)^T H (z-v), v = x + u    (project onto the sparsity budget)
-u <- u + x - z                                          (track the disagreement)
-```
+HGRN-1.3B (`fla-hub/hgrn-1.3B-100B`) at 80% sparsity. Perplexity uses ELSA's
+own evaluation protocol, so the rows are directly comparable. Lower is better.
 
-`f` is cross-entropy plus a knowledge-distillation term against the
-original dense model (`f = 0.5 * CE + 0.5 * KD`) -- both computed on
-unlabeled text, so no task-specific data is needed. `H` is the standard
-SparseGPT/CWS reconstruction Hessian (`2/N * sum x x^T` over calibration
-activations); the Z-step keeps the `k` weights per row with the largest
-`H_ii * v_i^2` score and zeros the rest, which is the exact solution to
-the diagonal-approximated version of the projection above.
-
-**Phase 1** prunes each layer on its own, sequentially, in execution
-order. The default for the headline results below is the **local
-(ALPS-style) Phase 1** (`--p1-mode local`). Each layer minimises its own
-reconstruction error `||(W - W0) X||^2` under the same per-row constraint.
-It uses ADMM with a closed-form x-step and a penalty grown from 0.01 to
-10 x mean(diag H), then an exact least-squares refit of the kept weights.
-There's no backprop and no teacher, so it takes about 10 minutes on
-HGRN-1.3B. The older global Phase 1 (`--p1-mode global`) trains each layer
-against the full-model CE+KD loss instead and costs hours.
-
-**Phase 2** takes Phase 1's pruned model and makes every layer
-trainable at once, under one shared forward pass -- so gradients can
-couple across layers instead of being optimized one at a time. All
-layers share one uniform target sparsity ratio. This gets re-run once per
-sparsity level you actually want a model at. Phase 2 can train in float32
-master precision under bf16 autocast (`--master-fp32`), on ELSA's own
-32,768 tokenized C4 training sequences with each seen once
-(`--elsa-train-cache`, `--p2-epoch-sampling`). It can also train the
-non-pruned parameters (norms, embeddings, lm_head) with no penalty
-(`--p2-train-extra`), and re-measure diag(H) for the Z-step from its own
-training forward passes (`--p2-hessian-refresh`).
-
-## Measured results
-
-Both models at 80% sparsity. Perplexity uses ELSA-official's own
-evaluation protocol (its WikiText-2 / C4 test sets and formula, fp16), so
-every row is directly comparable. All rows are single runs.
-
-| Model | This method (WT2 / C4) | ELSA, same row-wise constraint | ELSA, unstructured |
+| | Sparsity pattern | WikiText-2 | C4 |
 |---|---|---|---|
-| HGRN-1.3B | **46.49 / 34.58** | 58.79 / 40.30 | 54.08 / 36.92 |
-| OPT-125M | **66.65 / 49.45** | 75.86 / 53.45 | 65.30 / 47.74 (paper) |
+| Dense model | none | 11.81 | 16.09 |
+| **EHWS (this code)** | **semi-structured** | **46.49** | **34.58** |
+| ELSA, official code | semi-structured (same constraint) | 58.79 | 40.30 |
+| ELSA, official code | unstructured | 54.08 | 36.92 |
 
-### HGRN-1.3B
-
-`fla-hub/hgrn-1.3B-100B`, 80% sparsity.
-
-| | Sparsity type | WikiText2 PPL | C4 PPL |
-|---|---|---|---|
-| Dense | -- | 11.81 | 16.09 |
-| **Two-phase, local (ALPS) Phase 1 (this method)** | **semi-structured** | **46.49** | **34.58** |
-| ELSA official code | semi-structured (same per-row constraint) | 58.79 | 40.30 |
-| ELSA official code | unstructured | 54.08 | 36.92 |
-
-Zero-shot accuracy (7-task average): dense 0.438, this model 0.377. The
-weights are on Hugging Face:
+Zero-shot accuracy (7-task average): dense 0.438, EHWS 0.377. The
+`results.json` for this run is in `results/_s16_hgrn/`, and the pruned weights
+are on Hugging Face:
 [ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct).
 
-This beats ELSA under the same row-wise constraint by 21% (WikiText2) and
-14% (C4), and also beats ELSA's unstructured run. The result came from
-four Phase 2 changes on top of the local Phase 1:
-- float32 master weights (HGRN previously trained in pure bf16)
-- ELSA's 32,768 training sequences, each seen once (previously 2,048,
-  resampled)
-- training the non-pruned parameters, as ELSA does
-- refreshing diag(H) during Phase 2
+OPT-125M at 80%: EHWS 66.65 / 49.45, ELSA under the same constraint
+75.86 / 53.45 (see [OPT-125M](#opt-125m) below).
 
-Earlier versions of the same two-phase pipeline scored 71.41 / 45.87
-(local Phase 1 without those changes) and 87.73 / 55.46 (global Phase 1).
-The four changes were applied together, so their individual
-contributions aren't separated yet. See `PROGRESS.md` (Sessions 14-16).
+All results are single runs. Repeating the same run can move WikiText-2 by up
+to about 5%; C4 moves much less.
 
-An earlier audit against ELSA's own run on this model is also why any of
-this works: it showed the ADMM penalty (`lambda`) had been 200x too small
-for HGRN (`0.01` constant in ELSA's run vs `5e-5` cosine-ramped here).
-See `ehws/hparams.py`'s module docstring.
+## How the method works
 
-### OPT-125M
+Every prunable layer is an `nn.Linear` inside a model block. Embeddings and
+the output head stay dense.
 
-`facebook/opt-125m`, 80% sparsity.
+### Phase 1: prune each layer on its own (ALPS)
 
-| | Sparsity type | WikiText2 PPL | C4 PPL |
-|---|---|---|---|
-| Dense | -- | 27.61 | 26.52 |
-| ELSA paper | unstructured | 65.30 | 47.74 |
-| **Two-phase, local (ALPS) Phase 1 (this method)** | **semi-structured** | **66.65** | **49.45** |
-| ELSA official code | semi-structured (same per-row constraint) | 75.86 | 53.45 |
+Phase 1 goes through the layers in the order the model runs them. For each
+layer it asks: *which weights can I remove so that this layer's output
+changes as little as possible?*
 
-The ELSA unstructured row is the paper's own number (paper evaluation;
-its dense row is ~0.15% off ELSA's released code). Zero-shot accuracy was
-not measured for this run. The weights are on Hugging Face:
-[ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct).
+1. Run 256 calibration sequences through the model and record the inputs `X`
+   reaching this layer. From them, build `H = (2/N) X Xᵀ`. `H` describes which
+   input directions matter for this layer.
+2. Find sparse weights `W` that keep the output close to the original
+   weights `W0`. Formally, minimize `‖(W − W0) X‖²` with each row keeping
+   exactly `k` weights.
+3. Solve step 2 with ADMM, as ALPS does. ADMM alternates two easy
+   sub-problems:
+   - **x-step:** find the best weights while ignoring sparsity, plus a penalty
+     `ρ` for being far from the current sparse guess. This has an exact
+     closed-form solution, so no training or backprop is needed.
+   - **z-step:** project onto the sparsity pattern. Each row keeps its `k`
+     weights with the largest `H_ii · w_i²`.
 
-This beats ELSA under the same row-wise constraint by 12% (WikiText2) and
-7.5% (C4), and is within 2.1% / 3.6% of ELSA's unstructured result. It uses
-the same local Phase 1 and Phase 2 data / extras / H-refresh options as
-HGRN (OPT-125M always trained in float32), with two OPT-specific Phase 2
-settings found by sweeping:
-- ADMM penalty `lambda = 3e-3`, constant. ELSA's own OPT-125M value is
-  1e-3 (82.31 / 55.69 here). 2e-3, 5e-3 and 1e-2 were all worse, and a
-  cosine ramp to 1e-2 was much worse (94.40 / 63.56).
-- Phase 2 `lr = 4e-4` (6e-4: 73.85 / 52.52; 9e-4: 145.67 / 85.60).
+   The penalty `ρ` grows from small to large (0.01 to 10 × mean of `diag(H)`,
+   over 50 rounds). Early rounds explore which weights to keep. Late rounds
+   force the dense and sparse solutions to agree.
+4. Keep the chosen positions and re-solve for their values exactly (a
+   least-squares refit), so the surviving weights compensate for the removed
+   ones.
+5. Write the pruned weights into the model, then move to the next layer. The
+   next layer therefore sees inputs from an already-pruned network.
 
-The sweeps are in `PROGRESS.md` (Sessions 17-19). They ran from
-`../opt125m/`, a copy of this code with a few extra OPT-only options, all
-off for this result, so the command below gives the same run from either
-folder.
+On HGRN-1.3B, Phase 1 takes about 10 minutes. It uses no teacher and no
+gradients.
 
-## Running HGRN-1.3B (80% sparsity)
+### Phase 2: train the whole pruned model (ELSA-style ADMM)
 
-Set up the environment once:
+Phase 2 makes every pruned layer trainable at once and trains on real text.
+It repeats these three steps:
+
+```
+x ← train for 32 steps on  f(x) + (λ/2)‖x − z + u‖²   (learn, while staying near the sparse z)
+z ← keep the top-k weights per row of (x + u)          (project onto the sparsity pattern)
+u ← u + x − z                                          (track the remaining disagreement)
+```
+
+- The loss is `f = 0.5 · cross-entropy + 0.5 · KD`. KD is a distillation term
+  that matches the original dense model's predictions. No labels are needed.
+- There are 128 rounds of 32 steps, so 4,096 Adam steps at batch size 8.
+- The training data is ELSA's own 32,768 C4 sequences, each seen once.
+- At the end, the weights are set to `z`. The model is exactly sparse, and
+  every row has the same number of nonzeros.
+
+Phase 2 also uses four options that matter on HGRN:
+- `--master-fp32`: weights and Adam state are kept in float32, and the
+  forward pass runs in bf16.
+- `--p2-train-extra`: norms, embeddings and the output head are also trained,
+  without a sparsity penalty.
+- `--p2-hessian-refresh`: `diag(H)` is re-measured during training, so the
+  z-step's scores follow the model as it changes.
+- `--p2-epoch-sampling`: each training sequence is used once.
+
+## Reproducing the HGRN-1.3B result
+
+You need one GPU with 40 GB of memory (peak use is about 36 GB) and about
+4 hours.
+
+All commands start from the root of this repository.
+
+**1. Install** (Python 3.11):
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r semi-structured/requirements.txt
 ```
 
-**Two-phase with local Phase 1 (46.49 / 34.58 above).** The training
-data is ELSA's own tokenized cache. Build it once by running ELSA-official
-with `--admm_save_inputs=True` on this model, or point
-`--elsa-train-cache` at an existing copy.
+**2. Build the training data.** Phase 2 trains on exactly the tokens ELSA
+uses. Build them with ELSA's own code (about 35 minutes, CPU only):
 
 ```bash
-python run_pipeline.py --model fla-hub/hgrn-1.3B-100B \
-  --sparsities 0.8 --zeroshot-sparsities 0.8 --seqlen 2048 --n-eval-c4 256 \
-  --micro-batch 2 --grad-accum 4 --p2-micro-batch 1 --p2-grad-accum 8 \
-  --dtype bfloat16 --master-fp32 --gradient-checkpointing \
-  --no-auto-hparams --p2-lr 6e-4 --p2-lambda-max 0.01 --p2-lambda-schedule constant --adam-beta2 0.95 \
-  --p1-mode local --hessian-n-calib 256 \
-  --elsa-train-cache ELSA-official/dataset/fla-hub_hgrn-1.3B-100B/train/c4_32768_2048_hub \
-  --p2-epoch-sampling --p2-train-extra --p2-hessian-refresh \
-  --out results/hgrn-1.3b-0.8
+git clone https://github.com/log-postech/elsa.git
+cd elsa        # use ELSA's environment (see its README)
+python ../semi-structured/scripts/build_elsa_train_cache.py --model fla-hub/hgrn-1.3B-100B
+cd ..
 ```
 
-**Every non-default flag above is load-bearing, not cosmetic:**
+It prints the path to pass in the next step, e.g.
+`elsa/dataset/fla-hub_hgrn-1.3B-100B/train/c4_32768_2048_hub`.
 
-- `--no-auto-hparams --p2-lr 6e-4 --p2-lambda-max 0.01 --p2-lambda-schedule constant --adam-beta2 0.95` --
-  without this, `run_pipeline.py` falls back to `ehws/hparams.py`'s auto-hparams
-  table, which for HGRN@80% uses `lr=2e-4` (ELSA's raw, un-retuned value) and
-  the stock Adam `beta2=0.999`. That combination was actually run
-  (`results/hgrn-1.3b-lambdafix-lr2e-4/`) and scores **WT2 207.7 / C4 125.2**
-  -- 2-3x worse, with no warning or error. `lambda=0.01` is already correct
-  in the auto-hparams table; `lr` and `beta2` are not.
-- `--dtype bfloat16 --master-fp32` -- the teacher is stored in bf16. The
-  student keeps float32 weights, gradients and Adam state and runs its
-  forward under bf16 autocast, as ELSA does. Without `--master-fp32`, the
-  bf16 weights are trained directly, and small late-schedule updates
-  round away.
-- `--gradient-checkpointing --p2-micro-batch 1 --p2-grad-accum 8` --
-  memory only, no effect on the result. Phase 2 peaks at about 34 GB, so it
-  needs an A100-40GB-class GPU or better.
+**3. Run:**
 
-**Runtime and reproducibility:** about 4h wall-clock on one A100-40GB
-(local Phase 1 ~10 min, Phase 2 ~3.3h, plus evaluation). Expect
-run-to-run variance, not bit-exact reproduction: repeats of identical
-configs have moved WikiText2 by up to ~5% (C4 is much more stable). See
-`PROGRESS.md`.
+```bash
+cd semi-structured
+bash scripts/run_hgrn.sh ../elsa/dataset/fla-hub_hgrn-1.3B-100B/train/c4_32768_2048_hub
+```
 
-## Running OPT-125M (80% sparsity)
+The script runs Phase 1, Phase 2 and the evaluation. It writes
+`results/hgrn-1.3b-0.8/results.json` and the pruned weights to
+`results/hgrn-1.3b-0.8/model-s0.8/`. Compare `wikitext2_ppl_elsa` and
+`c4_ppl_elsa` against the table above.
 
-**Two-phase with local Phase 1 (66.65 / 49.45 above).** Same environment
-and ELSA training cache as for HGRN (here, ELSA's OPT-125M cache):
+For a different sparsity, pass it as the second argument, e.g.
+`bash scripts/run_hgrn.sh <data dir> 0.9`. The other settings stay the same.
+
+### The HGRN settings, and why each one is needed
+
+`scripts/run_hgrn.sh` contains the full command. These are the settings that
+matter:
+
+| Setting | Value | Why |
+|---|---|---|
+| `--p1-mode local` | ALPS Phase 1 | Fast and accurate per-layer pruning. The older `global` mode takes hours and does worse. |
+| `--hessian-n-calib` | 256 | Calibration sequences used to build each `H`. |
+| `--no-auto-hparams` | | **Required.** Without it, the code uses a built-in table (`ehws/hparams.py`) with the wrong learning rate for this setup, and the result is 2–3× worse with no warning. |
+| `--p2-lr` | 6e-4 | Phase 2 learning rate. This is 3× ELSA's value, to make up for the KD term. |
+| `--p2-lambda-max`, `--p2-lambda-schedule` | 0.01, constant | ADMM penalty strength, the same as ELSA's HGRN run. |
+| `--adam-beta2` | 0.95 | Same as ELSA. The PyTorch default (0.999) is worse here. |
+| `--elsa-train-cache`, `--p2-epoch-sampling` | ELSA's data, each sequence once | Same training data as ELSA. |
+| `--p2-train-extra` | on | Also trains the non-pruned parameters, as ELSA does. |
+| `--p2-hessian-refresh` | on | Updates the z-step's `diag(H)` during training. |
+| `--dtype bfloat16 --master-fp32` | | bf16 teacher and forward pass, float32 weights and optimizer. Without `--master-fp32`, small updates are lost to bf16 rounding. |
+| `--gradient-checkpointing`, `--p2-micro-batch 1 --p2-grad-accum 8` | | Memory only, so it fits in 40 GB. The effective batch size is still 8. |
+
+## OPT-125M
+
+Same method, with two settings changed for this model: `lambda 3e-3`, and
+`lr 4e-4` with Adam's default `beta2`. It runs in float32 and uses ELSA's
+OPT-125M data, built with the same script and `--model facebook/opt-125m`.
 
 ```bash
 python run_pipeline.py --model facebook/opt-125m \
   --sparsities 0.8 --seqlen 2048 --n-eval-c4 256 --dtype float32 \
   --p1-mode local --hessian-n-calib 256 \
-  --elsa-train-cache ELSA-official/dataset/facebook_opt-125m/train/c4_32768_2048_hub \
+  --elsa-train-cache <path>/facebook_opt-125m/train/c4_32768_2048_hub \
   --p2-epoch-sampling --p2-train-extra --p2-hessian-refresh \
   --no-auto-hparams --p2-lr 4e-4 --p2-lambda-max 3e-3 --p2-lambda-schedule constant --adam-beta2 0.999 \
-  --skip-zeroshot --save-model \
-  --out results/opt-125m-0.8
+  --skip-zeroshot --save-model --out results/opt-125m-0.8
 ```
 
-`--no-auto-hparams` and the four values after it are required: the
-auto-hparams table would use ELSA's lambda 1e-3. Unlike HGRN, Adam
-`beta2` stays at 0.999 (0.95 was worse on OPT-125M). Each run needs
-~14-19 GB, so two fit on one A100-40GB; with two sharing a GPU, each took
-about 3.5h wall-clock.
+## Evaluation
 
-## Hyperparameters
+Each run reports perplexity two ways in `results.json`:
+- `wikitext2_ppl_elsa` / `c4_ppl_elsa`: ELSA's exact protocol (its test sets,
+  formula and float16 evaluation). **Use these to compare with ELSA.**
+- `wikitext2_ppl` / `c4_ppl`: the full WikiText-2 test set and a 256-sequence
+  slice of C4 validation.
 
-Phase 2's `(lr, lambda, schedule)` per model/sparsity come from
-`ehws/hparams.py`, sourced from ELSA's own published values for the
-models it covers (OPT-125M, OPT-1.3B) -- see that file for the exact
-table and how the untabulated points were filled in. `fla-hub/hgrn-1.3B-100B`
-at 80% sparsity is the one entry backed by *measured* ground truth rather
-than an approximation: ELSA's own code was actually run against this
-model, and its logged hyperparameters (`lr=2e-4, lambda=0.01 constant,
-beta2=0.95`) replaced an earlier OPT-1.3B-table guess that turned out to
-be 200x too small on `lambda` -- every other HGRN sparsity still falls
-back to that same approximation.
+Zero-shot accuracy covers ARC-Easy, ARC-Challenge, BoolQ, HellaSwag,
+OpenBookQA, RTE and Winogrande, run with `lm-evaluation-harness`.
 
-**The auto-hparams table's `lr=2e-4` is ELSA's raw value, not what this
-repo's headline HGRN results use.** Because this project's objective
-mixes in a KD term ELSA's doesn't have (`f = 0.5*CE + 0.5*KD` vs ELSA's
-pure CE), the effective task-loss gradient is diluted relative to
-ELSA's own tuning assumption. The headline HGRN result above uses `lr`
-retuned to `6e-4` (3x) to compensate, on top of the corrected `lambda`. `beta2=0.95` is a plain manual override -- it has
-no auto-hparams table entry at all and silently defaults to PyTorch's
-stock `0.999` if you forget it. See
-[Running HGRN-1.3B](#running-hgrn-13b-80-sparsity) for the exact flags
-this actually requires, and `ehws/hparams.py`'s module docstring for the
-full numeric comparison. The local Phase 1 has no learning rate or
-lambda. Its settings are `--p1-local-rounds 50`, `--p1-local-rho-start
-0.01`, `--p1-local-rho-end 10` and the refit (on by default). Phase 2
-mixes in a knowledge-distillation term at `alpha_kd=0.5`. Full config for any run
-is dumped verbatim into `results/<name>/results.json`.
+`eval_external.py` re-scores any saved model (ours or ELSA's). It also checks
+the sparsity and that every row has the same number of nonzeros:
 
-## Calibration & evaluation
+```bash
+python eval_external.py --model fla-hub/hgrn-1.3B-100B \
+  --weights results/hgrn-1.3b-0.8/model-s0.8/model.safetensors \
+  --calib-cache results/hgrn-1.3b-0.8/cache --out results/rescore
+```
 
-Calibration/training data is either `--n-calib` sequences of 2048
-tokens sampled from C4's training split, or ELSA's own cached training
-set (`--elsa-train-cache`). Perplexity is reported two ways. Our
-protocol uses WikiText-2's test split and a held-out slice of C4's
-validation split. ELSA's protocol (`wikitext2_ppl_elsa` /
-`c4_ppl_elsa`) uses ELSA-official's own test sets, formula and fp16 eval,
-and matches its printed numbers exactly. Compare against ELSA only with
-the ELSA-protocol numbers. `eval_external.py` rescores any saved state
-dict under both protocols and checks that every row has the same number
-of nonzeros.
-Zero-shot accuracy uses the standard 7-task 0-shot set (ARC-Easy/
-Challenge, BoolQ, HellaSwag, OpenBookQA, RTE, Winogrande) via
-`lm-evaluation-harness`.
-
-## Architecture support
-
-Any decoder-only causal LM built from `nn.Linear` layers inside repeated
-transformer blocks -- covers OPT, LLaMA, and HGRN (`fla-hub/hgrn-1.3B-100B`)
-out of the box, via an execution-order trace rather than hardcoded
-per-architecture wiring (`ehws/model_layers.py`).
-
-## Layout
+## Code layout
 
 ```
+run_pipeline.py          # end to end: dense eval -> Phase 1 -> Phase 2 -> eval -> results.json
+eval_external.py         # re-score a saved pruned model
+scripts/
+  run_hgrn.sh            # the HGRN-1.3B command with the settings above
+  build_elsa_train_cache.py  # builds ELSA's training data with ELSA's code
 ehws/
-  hessian.py              # H = (2/N) X^T X accumulation
-  diagonal_projection.py  # the Z-step: keep top-k by H_ii * v_i^2 per row
-  model_layers.py          # architecture-agnostic prunable-layer discovery
-  losses.py                 # the X-step's objective: CE + KD
-  admm.py                    # Phase 1 / Phase 2 drivers
-  calibration.py              # C4 calibration + WikiText2/C4 eval data
-  perplexity.py                # perplexity evaluation
-  zeroshot.py                   # lm-eval-harness wrapper
-  hparams.py                     # per-model/per-sparsity (lr, lambda) lookup
-run_pipeline.py                   # end-to-end driver
-requirements.txt
+  admm.py                # Phase 1 (local/ALPS and global) and Phase 2
+  diagonal_projection.py # z-step: keep top-k per row by H_ii * w_i^2
+  hessian.py             # H = (2/N) X Xᵀ from calibration inputs
+  losses.py              # cross-entropy + KD loss
+  model_layers.py        # finds the prunable layers of any decoder model, in run order
+  calibration.py         # C4 / WikiText-2 data, including ELSA's versions
+  perplexity.py          # both perplexity protocols
+  zeroshot.py            # lm-evaluation-harness wrapper
+  hparams.py             # default (lr, lambda) table; bypassed by --no-auto-hparams
+  obs_projection.py      # alternative z-steps, for ablations only
+results/_s16_hgrn/       # the exact launch config and results.json of the HGRN result above
 ```
+
+The code works with any decoder-only model built from `nn.Linear` layers
+inside repeated blocks, including OPT, LLaMA and HGRN. It finds the layers by
+tracing one forward pass, so no per-model wiring is needed.
