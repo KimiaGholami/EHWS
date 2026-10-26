@@ -16,26 +16,182 @@ like 2:4.
 
 ## Results
 
-HGRN-1.3B (`fla-hub/hgrn-1.3B-100B`) at 80% sparsity. Perplexity uses ELSA's
-own evaluation protocol, so the rows are directly comparable. Lower is better.
+Perplexity is **WikiText-2 / C4** under ELSA's own evaluation protocol (its
+test sets and formula, float16), so every row is directly comparable. Lower is
+better. Mamba overflows float16, so every Mamba number (dense and pruned) is
+bfloat16. Zero-shot is the average accuracy over 7 tasks (ARC-C, ARC-E, BoolQ,
+HellaSwag, OBQA, RTE, Winogrande), higher is better.
 
-| | Sparsity pattern | WikiText-2 | C4 |
-|---|---|---|---|
-| Dense model | none | 11.81 | 16.09 |
-| **EHWS (this code)** | **semi-structured** | **46.49** | **34.58** |
-| ELSA, official code | semi-structured (same constraint) | 58.79 | 40.30 |
-| ELSA, official code | unstructured | 54.08 | 36.92 |
+The baselines come from ELSA's official code, run on the same models:
+- **ELSA row-wise** uses ELSA's code with the same constraint as EHWS (every row keeps the same number of weights).
+- **ELSA unstructured** is ELSA's own setting, a looser constraint.
 
-Zero-shot accuracy (7-task average): dense 0.438, EHWS 0.377. The
-`results.json` for this run is in `results/_s16_hgrn/`, and the pruned weights
-are on Hugging Face:
-[ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct).
+"vs best ELSA" compares EHWS with the better of the two. Unless marked
+*tuned*, ELSA uses lr 2e-4 and lambda 1e-2, its HGRN-1.3B setting at 80%.
+EHWS uses its HGRN 80% recipe unchanged on every model. All results are
+single runs (seed 0). Repeating a run can move WikiText-2 by up to about 5%
+and C4 by under 0.5%.
 
-OPT-125M at 80%: EHWS 66.65 / 49.45, ELSA under the same constraint
-75.86 / 53.45 (see [OPT-125M](#opt-125m) below).
+### Headline
 
-All results are single runs. Repeating the same run can move WikiText-2 by up
-to about 5%; C4 moves much less.
+| Model | Sparsity | EHWS | Best ELSA | EHWS vs best ELSA |
+|---|---|---|---|---|
+| HGRN-1.3B | 80% | **46.49 / 34.58** | 53.92 / 36.93 | -14% / -6% |
+| HGRN-1.3B | 90% (both tuned) | **81.74 / 47.42** | 115.59 / 60.21 | -29% / -21% |
+| Gated DeltaNet-1.3B | 80% | **22.88 / 23.67** | 26.19 / 26.24 | -13% / -10% |
+| Gated DeltaNet-340M | 80% | **38.58 / 33.23** | 45.95 / 38.18 | -16% / -13% |
+| Mamba-1.3B | 80% | **25.03 / 25.49** | 29.08 / 28.92\* | -14% / -12% |
+| OPT-125M | 80% | **66.65 / 49.45** | 75.86 / 53.45 (row-wise) | -12% / -7% |
+
+\* ELSA's own float16 number; a bfloat16 re-score is pending.
+
+EHWS has the lower perplexity in every comparison on HGRN, Gated DeltaNet and
+Mamba from 30% to 90% sparsity. Zero-shot accuracy is roughly on par (see
+[Zero-shot accuracy](#zero-shot-accuracy)).
+
+### HGRN-1.3B across sparsity
+
+`fla-hub/hgrn-1.3B-100B`; dense 11.81 / 16.09, zero-shot 0.438.
+
+| Sparsity | EHWS | ELSA row-wise | ELSA unstructured | EHWS vs best ELSA | Zero-shot EHWS / ELSA row / ELSA unstr |
+|---|---|---|---|---|---|
+| 30% | **15.35 / 15.67** | 17.25 / 17.64 | 17.18 / 17.64 | -11% / -11% | 0.415 / -- / 0.423 |
+| 50% | **17.48 / 16.92** | 19.97 / 19.72 | 19.58 / 19.59 | -11% / -14% | 0.414 / 0.417 / 0.415 |
+| 70% | **27.68 / 23.16** | 33.01 / 28.27 | 32.58 / 27.15 | -15% / -15% | 0.389 / 0.388 / 0.392 |
+| 80% | **46.49 / 34.58** | 58.79 / 40.30 | 53.92 / 36.93 | -14% / -6% | 0.377 / 0.369 / 0.368 |
+| 90%, untuned | 105.72 / 63.59 | 192.68 / 78.18 | 213.97 / 79.08 | -45% / -19% | 0.360 / 0.360 / 0.362 |
+| **90%, both tuned** | **81.74 / 47.42** | 144.16 / 68.91 | 115.59 / 60.21 | -29% / -21% | 0.371 / -- / -- |
+
+### Tuning both methods at 90% (HGRN-1.3B)
+
+90% is far from the 80% setting both methods were tuned on, so both were
+re-tuned there.
+
+EHWS, one change at a time from the 80% recipe:
+
+| Change | WikiText-2 / C4 | Zero-shot |
+|---|---|---|
+| none (Phase 1 straight to 90%) | 105.72 / 63.59 | 0.360 |
+| Phase 2 lr 4e-4 (was 6e-4) | 107.67 / 65.02 | 0.356 |
+| Phase 1 to 80%, Phase 2 to 90% | 84.22 / 49.66 | 0.356 |
+| **Phase 1 to 70%, Phase 2 to 90%** | **81.74 / 47.42** | **0.371** |
+| Phase 1 to 60%, Phase 2 to 90% | 86.18 / 48.94 | 0.366 |
+
+ELSA, starting from the settings in the ELSA paper's Table 5 at 90%:
+
+| ELSA variant and setting | Adam beta2 | WikiText-2 / C4 |
+|---|---|---|
+| unstructured, lambda 1e-2 (original) | 0.95 | 213.97 / 79.08 |
+| unstructured, lambda 1e-2 | 0.999 | 281.20 / 96.97 |
+| **unstructured, lambda 1e-3** | 0.999 | **115.59 / 60.21** |
+| row-wise, lambda 1e-3 | 0.999 | 144.16 / 68.91 |
+
+The lambda carried over from 80% badly under-tunes ELSA at 90%. With both
+methods tuned, EHWS is 29% / 21% lower than ELSA unstructured and 43% / 31%
+lower than ELSA row-wise.
+
+### Phase 1 to 70% on other models
+
+The best HGRN 90% setting stops Phase 1 at 70% and lets Phase 2 prune the rest
+of the way. Applied unchanged to other models:
+
+| Model | Sparsity | Phase 1 straight to target | Phase 1 to 70% | Change |
+|---|---|---|---|---|
+| HGRN-1.3B | 90% | 105.72 / 63.59 | **81.74 / 47.42** | -23% / -25% |
+| Gated DeltaNet-1.3B | 90% | 44.83 / 38.99 | **37.67 / 32.78** | -16% / -16% |
+
+Mamba-1.3B and Gated DeltaNet-340M at 90%, and all models at 80%, are running.
+
+### Gated DeltaNet
+
+`m-a-p/1.3B-100B-GatedDeltaNet-pure` and `m-a-p/340M-20B-GatedDeltaNet-pure-baseline`.
+
+| Model | Sparsity | Dense | EHWS | ELSA row-wise | ELSA unstructured | EHWS vs best ELSA | Zero-shot EHWS / ELSA row / ELSA unstr (dense) |
+|---|---|---|---|---|---|---|---|
+| 1.3B | 80% | 10.31 / 13.76 | **22.88 / 23.67** | 26.19 / 26.24 | 26.28 / 26.17 | -13% / -10% | 0.399 / 0.408 / 0.408 (0.512) |
+| 1.3B | 90% | 10.31 / 13.76 | 44.83 / 38.99 | running | 46.76 / 43.13 | -4% / -10% | 0.369 / -- / -- |
+| 1.3B | 90%, Phase 1 to 70% | 10.31 / 13.76 | **37.67 / 32.78** | running | 46.76 / 43.13 | -19% / -24% | 0.381 / -- / -- |
+| 340M | 80% | 16.42 / 19.94 | **38.58 / 33.23** | 47.47 / 38.31 | 45.95 / 38.18 | -16% / -13% | 0.380 / 0.380 / 0.376 (0.437) |
+
+At 90% on Gated DeltaNet, ELSA still uses lambda 1e-2. On HGRN, lambda 1e-3
+helped ELSA a lot at 90%, so these margins may shrink once ELSA is tuned here.
+
+### Mamba-1.3B
+
+`fla-hub/mamba-1.3B-100B`, all numbers in bfloat16. Both methods keep Mamba's
+`dt_proj` dense (about 2% of the block's linear weights).
+
+| Sparsity | Dense | EHWS | ELSA row-wise | ELSA unstructured | EHWS vs best ELSA | Zero-shot EHWS / ELSA unstr (dense) |
+|---|---|---|---|---|---|---|
+| 80% | 10.03 / 14.12 | **25.03 / 25.49** | 29.08 / 28.92\* | 30.13 / 28.49 | -14% / -12% | 0.380 / 0.384 (0.435) |
+
+\* ELSA's own float16 number; a bfloat16 re-score is pending.
+
+### OPT-125M (80%)
+
+| | WikiText-2 / C4 | Zero-shot |
+|---|---|---|
+| Dense | 27.61 / 26.52 | -- |
+| **EHWS** | **66.65 / 49.45** | 0.366 |
+| ELSA row-wise | 75.86 / 53.45 | 0.375 |
+| ELSA unstructured (number from the ELSA paper) | 65.30 / 47.74 | -- |
+
+OPT-125M is the one case where ELSA comes out ahead: its unstructured paper
+number beats EHWS. Against ELSA under the same row constraint, EHWS is lower.
+
+### Zero-shot accuracy
+
+At 70-90% sparsity, five of the seven tasks (ARC-C, OBQA, RTE, Winogrande,
+BoolQ) sit near chance or the majority-class rate for every method. This also
+holds in the ELSA paper's own tables (Tables 7-8). ARC-Easy and HellaSwag carry
+most of the signal:
+- **Gated DeltaNet-1.3B at 80%:** ELSA leads on ARC-Easy by 0.06, about 4
+  standard errors. This is the one clear gap.
+- **HGRN-1.3B at 70% and 90%:** EHWS leads on ARC-Easy.
+- **Everywhere else:** the differences are within noise.
+
+### Row balance: why semi-structured matters
+
+ELSA's unstructured models are not balanced across rows. The table gives the
+densest row's nonzeros divided by the mean row's:
+
+| ELSA unstructured model | Mean over layers | Worst layer |
+|---|---|---|
+| HGRN-1.3B @ 30% | 1.27x | 1.42x |
+| HGRN-1.3B @ 50% | 1.59x | 1.98x |
+| HGRN-1.3B @ 70% | 2.26x | 3.28x |
+| HGRN-1.3B @ 80% | 3.31x | 4.90x |
+| HGRN-1.3B @ 90% | 5.18x | 9.73x |
+| Gated DeltaNet-1.3B @ 80% | 2.47x | 4.41x |
+| Gated DeltaNet-340M @ 80% | 2.58x | 4.37x |
+| Mamba-1.3B @ 80% | 2.47x | 4.64x |
+
+Every EHWS and ELSA row-wise model is exactly 1.00x. At 90%, HGRN's starved
+rows concentrate in the recurrent gates: 3.0% of the forget-gate (`f_proj`)
+rows fall below a quarter of the mean density, and 6 of them are empty.
+
+### Pruned models
+
+All pruned weights, both ours and the ELSA baselines, are on Hugging Face at
+[huggingface.co/ikimyaii](https://huggingface.co/ikimyaii). Each repo has a
+model card with the method, settings, results and a row-balance check. Repo
+names give the model, size, sparsity pattern, method and sparsity. For
+example:
+- [HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct)
+- [HGRN-1.3B-semi-structured-EHWS-ALPS_phase1-p1t0.7-90pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS_phase1-p1t0.7-90pct)
+- [HGRN-1.3B-unstructured-ELSA-90pct-tuned](https://huggingface.co/ikimyaii/HGRN-1.3B-unstructured-ELSA-90pct-tuned)
+
+The `results.json` for the HGRN 80% run is in `results/_s16_hgrn/`.
+
+### Still running
+
+- Gated DeltaNet-1.3B / 340M and Mamba-1.3B at 50 / 70 / 90%, each with both
+  ELSA baselines.
+- Phase 1 to 70% on Mamba-1.3B and Gated DeltaNet-340M at 90%, and on every
+  model at 80%.
+- ELSA re-runs with lambda 1e-3 at 80%.
+- 2.7B models are deferred: they do not fit on one 40 GB A100 with float32
+  master weights.
 
 ## How the method works
 
