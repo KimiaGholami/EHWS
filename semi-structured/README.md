@@ -177,8 +177,8 @@ All pruned weights, both ours and the ELSA baselines, are on Hugging Face at
 model card with the method, settings, results and a row-balance check. Repo
 names give the model, size, sparsity pattern, method and sparsity. For
 example:
-- [HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS-phase1-80pct)
-- [HGRN-1.3B-semi-structured-EHWS-ALPS_phase1-p1t0.7-90pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-ALPS_phase1-p1t0.7-90pct)
+- [HGRN-1.3B-semi-structured-EHWS-80pct-v1](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-80pct-v1)
+- [HGRN-1.3B-semi-structured-EHWS-90pct](https://huggingface.co/ikimyaii/HGRN-1.3B-semi-structured-EHWS-90pct)
 - [HGRN-1.3B-unstructured-ELSA-90pct-tuned](https://huggingface.co/ikimyaii/HGRN-1.3B-unstructured-ELSA-90pct-tuned)
 
 The `results.json` for the HGRN 80% run is in `results/_s16_hgrn/`.

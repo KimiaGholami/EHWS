@@ -2,7 +2,7 @@
 
 A copy of `../semi-structured/` (code as of Session 17) for OPT-125M-only experiments. Changes tried here stay out of the main code until they prove themselves. See `../semi-structured/PROGRESS.md` (Sessions 17-19) for results and reasoning.
 
-**Best result so far (Session 19, `results/_s19_opt125m_batchA/`, arm `lr4e-4`):** 66.65 / 49.45 WikiText-2 / C4 PPL at 80% semi-structured sparsity (ELSA protocol). ELSA official under the same row-wise constraint scores 75.86 / 53.45, and the ELSA paper's unstructured number is 65.30 / 47.74. The weights are on Hugging Face: [ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct](https://huggingface.co/ikimyaii/OPT-125M-semi-structured-EHWS-ALPS-phase1-80pct). The exact command is in `../semi-structured/README.md` ("Running OPT-125M"); it uses none of the options below, so it gives the same run from either folder.
+**Best result so far (Session 19, `results/_s19_opt125m_batchA/`, arm `lr4e-4`):** 66.65 / 49.45 WikiText-2 / C4 PPL at 80% semi-structured sparsity (ELSA protocol). ELSA official under the same row-wise constraint scores 75.86 / 53.45, and the ELSA paper's unstructured number is 65.30 / 47.74. The weights are on Hugging Face: [ikimyaii/OPT-125M-semi-structured-EHWS-80pct](https://huggingface.co/ikimyaii/OPT-125M-semi-structured-EHWS-80pct). The exact command is in `../semi-structured/README.md` ("Running OPT-125M"); it uses none of the options below, so it gives the same run from either folder.
 
 Options this copy adds over `semi-structured/` (all off by default, so the default behavior is identical):
 
